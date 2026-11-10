@@ -1,0 +1,5 @@
+/target
+test.wav
+# Personal documents and their text caches stay local
+/docs/*
+!/docs/.gitkeep

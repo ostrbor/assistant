@@ -1,0 +1,22 @@
+# Root folder; each subfolder holds the PDFs for one call (pick it in the window)
+docs_dir = "docs"
+
+# How many seconds of recent speech to give the hint generator
+hint_window_secs = 60
+
+# After how many seconds a hint prepared in the background counts as stale
+hint_max_age_secs = 20
+
+[transcribe]
+# Transcription: OpenAI Realtime (key in the OPENAI_API_KEY environment variable)
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o-transcribe"
+language = "es"
+
+[llm]
+# LLM for translation and hints: any OpenAI-compatible endpoint (HF router by default)
+base_url = "https://router.huggingface.co/v1"
+api_key_env = "HF_TOKEN"
+translate_model = "openai/gpt-oss-20b:groq"
+# Hints go to all listed models in parallel; the first to answer wins (hedging)
+hint_models = ["openai/gpt-oss-120b:cerebras", "openai/gpt-oss-120b:groq"]
