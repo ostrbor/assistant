@@ -5,6 +5,7 @@ mod docs;
 mod hint;
 mod interview;
 mod llm;
+mod logfile;
 mod realtime;
 mod search;
 mod state;
@@ -20,9 +21,10 @@ fn main() -> Result<()> {
         println!("assistant {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let workdir = config::prepare_workdir()?;
+    logfile::redirect_stderr(&workdir);
     #[cfg(feature = "updater")]
     update::check_and_restart();
-    let workdir = config::prepare_workdir()?;
     let cfg = Arc::new(config::Config::load("config.toml")?);
     let keys_msg = {
         let m = cfg.missing_keys();
