@@ -20,11 +20,13 @@ pub struct App {
     show_audio: bool,
     /// Identifies the report that was last auto-opened, so it pops up once per load.
     report_seen: Option<(Option<String>, usize, usize)>,
+    /// A right-click on selected text asked to copy it: replay Ctrl+C on the next frame.
+    pending_copy: bool,
 }
 
 impl App {
     pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration) -> Self {
-        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false, show_report: false, show_audio: false, report_seen: None }
+        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false, show_report: false, show_audio: false, report_seen: None, pending_copy: false }
     }
 
     fn send(&self, c: Cmd) {
@@ -69,6 +71,23 @@ fn icon_button(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, fill: Option<C
     resp
 }
 
+/// Right-click on text: with a selection it is copied at once (like in a terminal);
+/// without one a small menu offers to copy the whole item.
+fn copy_menu(resp: &egui::Response, whole: &str, pending_copy: &mut bool) {
+    if egui::text_selection::LabelSelectionState::load(&resp.ctx).has_selection() {
+        if resp.secondary_clicked() {
+            *pending_copy = true;
+        }
+    } else {
+        resp.context_menu(|ui| {
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(whole.to_owned());
+                ui.close_menu();
+            }
+        });
+    }
+}
+
 fn age_text(d: Duration) -> String {
     let s = d.as_secs();
     if s < 5 {
@@ -82,6 +101,9 @@ fn age_text(d: Duration) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.pending_copy) {
+            ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+        }
         let AppState {
             segments,
             listening,
@@ -286,7 +308,8 @@ impl eframe::App for App {
             ui.add_space(2.0);
             egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
                 None => {
-                    ui.weak("The hint will appear here (Hint button).");
+                    ui.weak("The hint will appear here (Hint button).")
+                        .on_hover_text("Select text, then Ctrl+C or right-click to copy");
                 }
                 Some(h) => {
                     let age = h.started.map(|t| t.elapsed());
@@ -302,7 +325,8 @@ impl eframe::App for App {
                     if !h.question.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Q").size(24.0).strong().color(accent));
-                            ui.label(RichText::new(&h.question).size(17.0).color(ui.visuals().weak_text_color()));
+                            let r = ui.label(RichText::new(&h.question).size(17.0).color(ui.visuals().weak_text_color()));
+                            copy_menu(&r, &h.question, &mut self.pending_copy);
                         });
                     }
                     let amber = Color32::from_rgb(230, 170, 40);
@@ -317,10 +341,11 @@ impl eframe::App for App {
                     if h.done && h.es.is_empty() {
                         // The model broke the Q/ES/EN format: show what it actually said.
                         let msg = if h.raw.trim().is_empty() { "The model returned an empty answer." } else { h.raw.trim() };
-                        ui.label(RichText::new(msg).size(26.0).color(es_color));
+                        let r = ui.label(RichText::new(msg).size(26.0).color(es_color));
+                        copy_menu(&r, msg, &mut self.pending_copy);
                     } else {
                         let mut es = h.es.as_str();
-                        ui.add(
+                        let r = ui.add(
                             egui::TextEdit::multiline(&mut es)
                                 .font(egui::FontId::proportional(26.0))
                                 .text_color(es_color)
@@ -328,7 +353,9 @@ impl eframe::App for App {
                                 .desired_width(f32::INFINITY)
                                 .frame(false),
                         );
-                        ui.label(RichText::new(&h.en).size(18.0).color(en_color));
+                        copy_menu(&r, &format!("{}\n{}", h.es, h.en), &mut self.pending_copy);
+                        let r = ui.label(RichText::new(&h.en).size(18.0).color(en_color));
+                        copy_menu(&r, &h.en, &mut self.pending_copy);
                     }
                     if !h.done {
                         ui.spinner();
@@ -349,15 +376,22 @@ impl eframe::App for App {
                         if seg.partial {
                             es = es.italics();
                         }
-                        ui.label(es);
+                        let r = ui.label(es);
+                        copy_menu(&r, &seg.es, &mut self.pending_copy);
                     } else {
                         let mut es = RichText::new(&seg.es).size(24.0).color(ui.visuals().strong_text_color());
                         if seg.partial {
                             es = es.italics().color(Color32::from_gray(175));
                         }
-                        ui.label(es);
+                        let r = ui.label(es);
+                        let whole = match &seg.en {
+                            Some(en) => format!("{}\n{en}", seg.es),
+                            None => seg.es.clone(),
+                        };
+                        copy_menu(&r, &whole, &mut self.pending_copy);
                         if let Some(en) = &seg.en {
-                            ui.label(RichText::new(en).size(17.0).color(Color32::from_rgb(150, 190, 235)));
+                            let r = ui.label(RichText::new(en).size(17.0).color(Color32::from_rgb(150, 190, 235)));
+                            copy_menu(&r, &whole, &mut self.pending_copy);
                         } else if !seg.partial {
                             // Translation in progress.
                             ui.label(RichText::new("…").size(17.0).color(Color32::from_gray(110)));
