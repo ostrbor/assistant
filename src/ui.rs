@@ -91,12 +91,51 @@ fn copy_menu(resp: &egui::Response, whole: &str, pending_copy: &mut bool) {
 fn age_text(d: Duration) -> String {
     let s = d.as_secs();
     if s < 5 {
-        "just now".into()
+        "now".into()
     } else if s < 60 {
-        format!("{s} s ago")
+        format!("{s}s")
     } else {
-        format!("{} min ago", s / 60)
+        format!("{}m", s / 60)
     }
+}
+
+#[derive(Clone, Copy)]
+enum StatusIcon {
+    /// Animated sound bars.
+    Bars,
+    Warn,
+    Dash,
+    Dot,
+}
+
+/// Small painted status icon (the default font lacks the glyphs).
+fn status_icon(ui: &mut egui::Ui, kind: StatusIcon, color: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    match kind {
+        StatusIcon::Bars => {
+            let t = ui.ctx().input(|i| i.time) as f32;
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+            for i in 0..3 {
+                let k = 0.5 + 0.5 * (t * 6.0 + i as f32 * 1.7).sin();
+                let h = 4.0 + 10.0 * k;
+                let x = rect.left() + 2.0 + i as f32 * 4.5;
+                p.rect_filled(egui::Rect::from_min_max(egui::pos2(x, c.y + h / 2.0), egui::pos2(x + 3.0, c.y - h / 2.0)), 1.0, color);
+            }
+        }
+        StatusIcon::Warn => {
+            let pts = vec![egui::pos2(c.x, rect.top() + 1.0), egui::pos2(rect.right() - 1.0, rect.bottom() - 1.5), egui::pos2(rect.left() + 1.0, rect.bottom() - 1.5)];
+            p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+        }
+        StatusIcon::Dash => {
+            p.line_segment([egui::pos2(rect.left() + 2.0, c.y), egui::pos2(rect.right() - 2.0, c.y)], egui::Stroke::new(2.0_f32, color));
+        }
+        StatusIcon::Dot => {
+            p.circle_filled(c, 5.0, color);
+        }
+    }
+    resp
 }
 
 impl eframe::App for App {
@@ -147,15 +186,15 @@ impl eframe::App for App {
                     self.send(if listening { Cmd::Stop } else { Cmd::Start });
                 }
                 let hint_btn = icon_button(ui, None, "Hint", None, None, btn_size);
-                if hint_btn.on_hover_text("Get a hint right now (or a new one). Hints also appear by themselves after each question.").clicked() {
+                if hint_btn.on_hover_text("Get a hint right now (or a new one). Hints also appear by themselves after each question.\nSelect text, then Ctrl+C or right-click to copy.").clicked() {
                     self.send(Cmd::AskHint);
                 }
                 let armed = self.clear_armed.is_some_and(|t| t.elapsed() < CLEAR_CONFIRM);
                 if !armed {
                     self.clear_armed = None;
                 }
-                let clear_label = if armed { RichText::new("Clear? (click again)").color(Color32::LIGHT_RED) } else { RichText::new("Clear") };
-                if ui.button(clear_label).clicked() {
+                let clear_label = if armed { RichText::new("Sure?").color(Color32::LIGHT_RED) } else { RichText::new("Clear") };
+                if ui.button(clear_label).on_hover_text("Clear the dialog (click twice)").clicked() {
                     if armed {
                         self.clear_armed = None;
                         self.to_bottom = true;
@@ -166,16 +205,19 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
-                ui.label("Docs:");
-                let selected = topic.clone().unwrap_or_else(|| "— select —".into());
+                let selected = topic.clone().unwrap_or_else(|| "— docs folder —".into());
                 ui.add_enabled_ui(!loading, |ui| {
-                    egui::ComboBox::from_id_salt("topic").selected_text(selected).show_ui(ui, |ui| {
-                        for t in &topics {
-                            if ui.selectable_label(topic.as_deref() == Some(t.as_str()), t).clicked() {
-                                self.send(Cmd::SelectTopic(t.clone()));
+                    egui::ComboBox::from_id_salt("topic")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for t in &topics {
+                                if ui.selectable_label(topic.as_deref() == Some(t.as_str()), t).clicked() {
+                                    self.send(Cmd::SelectTopic(t.clone()));
+                                }
                             }
-                        }
-                    });
+                        })
+                        .response
+                        .on_hover_text("Documents folder used for hints");
                 });
                 if loading {
                     ui.spinner();
@@ -184,18 +226,21 @@ impl eframe::App for App {
                     self.send(Cmd::RefreshTopics);
                 }
                 ui.separator();
-                let mut st = status.clone();
-                if let Some(t) = since {
+                let timer = since.map(|t| {
                     let s = t.elapsed().as_secs();
-                    st = format!("{st} {:02}:{:02}", s / 60, s % 60);
                     ctx.request_repaint_after(Duration::from_secs(1));
-                }
-                if listening {
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 5.0, Color32::LIGHT_RED);
-                    ui.label(RichText::new(format!("REC {st}")).strong().color(Color32::LIGHT_RED));
-                } else {
-                    ui.label(st);
+                    format!("{:02}:{:02}", s / 60, s % 60)
+                });
+                if listening && status == "Listening" {
+                    // The red bar already says "recording": only a dot and the timer.
+                    status_icon(ui, StatusIcon::Dot, Color32::LIGHT_RED).on_hover_text("Recording");
+                    ui.label(RichText::new(timer.unwrap_or_default()).strong().color(Color32::LIGHT_RED));
+                } else if status != "Stopped" && !status.is_empty() {
+                    // Rare but important states (connecting, reconnecting…) stay as text.
+                    ui.label(match timer {
+                        Some(t) => format!("{status} {t}"),
+                        None => status.clone(),
+                    });
                 }
             });
             if let Some(e) = &conn_error {
@@ -233,15 +278,14 @@ impl eframe::App for App {
                 } else if let Some(r) = &docs_report {
                     let failed = r.files.iter().any(|f| matches!(f.status, FileStatus::Failed(_)));
                     let (color, text) = if problems == 0 {
-                        (Color32::from_rgb(60, 180, 90), format!("{} PDFs OK · {} chunks", r.files.len(), r.chunks))
+                        (Color32::from_rgb(60, 180, 90), format!("{} PDFs", r.files.len()))
                     } else {
                         let c = if failed { Color32::LIGHT_RED } else { Color32::from_rgb(230, 170, 40) };
-                        (c, format!("{problems} of {} PDFs with problems · {} chunks", r.files.len(), r.chunks))
+                        (c, format!("{problems}/{} PDFs: problems", r.files.len()))
                     };
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 5.0, color);
+                    status_icon(ui, StatusIcon::Dot, color);
                     let resp = ui.add(egui::Label::new(RichText::new(text).color(color)).sense(egui::Sense::click()));
-                    if resp.on_hover_text("Click to show the per-file report").clicked() {
+                    if resp.on_hover_text(format!("{} chunks · click for the per-file report", r.chunks)).clicked() {
                         self.show_report = !self.show_report;
                     }
                 }
@@ -294,43 +338,50 @@ impl eframe::App for App {
             let top = ui.max_rect().top() - 12.0;
             ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(screen.left(), top), egui::pos2(screen.right(), top + 4.0)), 0.0, accent);
             ui.add_space(2.0);
-            // Always say what is going on, so it is clear whether to wait or press Hint.
-            let busy = matches!(hint_status, HintStatus::Listening | HintStatus::Checking | HintStatus::Writing);
-            let note = match &hint_status {
-                HintStatus::Listening => Some("They are speaking…".to_string()),
-                HintStatus::Checking => Some("Checking whether that was a question…".to_string()),
-                HintStatus::Writing => Some("Writing the hint…".to_string()),
-                HintStatus::NoQuestion => Some("No question in what they just said. Press Hint to get an answer anyway.".to_string()),
-                HintStatus::Error(e) => Some(e.clone()),
-                HintStatus::Idle => hint.is_none().then(|| "Hints appear here by themselves after each question. Press Hint to ask now.".to_string()),
+            // One quiet header row: [AI chip] ........ [icon word · age]. Full sentences are tooltips.
+            let amber = Color32::from_rgb(230, 170, 40);
+            let age = hint.as_ref().and_then(|h| h.started).map(|t| t.elapsed());
+            if age.is_some() {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+            // (icon, spinner instead of icon, word, tooltip, color)
+            let status_info: Option<(Option<StatusIcon>, bool, &str, String, Color32)> = match &hint_status {
+                HintStatus::Listening => Some((Some(StatusIcon::Bars), false, "speaking", "They are speaking: a hint will follow their turn".into(), accent)),
+                HintStatus::Checking => Some((None, true, "checking", "Checking whether that was a question…".into(), accent)),
+                HintStatus::Writing => Some((None, true, "writing", "Writing the hint…".into(), accent)),
+                HintStatus::NoQuestion => Some((Some(StatusIcon::Dash), false, "no question", "No question in what they just said. Press Hint to get an answer anyway.".into(), Color32::GRAY)),
+                HintStatus::Error(e) => Some((Some(StatusIcon::Warn), false, "error", e.clone(), Color32::LIGHT_RED)),
+                HintStatus::Idle => None,
             };
-            if let Some(n) = note {
+            let own = hint.as_ref().is_some_and(|h| h.own);
+            if own || status_info.is_some() || age.is_some() {
                 ui.horizontal(|ui| {
-                    if busy {
-                        ui.spinner();
+                    if own {
+                        let chip = egui::Frame::none().fill(amber).rounding(4.0).inner_margin(egui::Margin::symmetric(5.0, 0.0));
+                        chip.show(ui, |ui| ui.label(RichText::new("AI").size(12.0).strong().color(Color32::BLACK))).response.on_hover_text("Generated by the model: not found in your documents");
                     }
-                    match &hint_status {
-                        HintStatus::Error(_) => ui.colored_label(Color32::LIGHT_RED, n),
-                        HintStatus::Idle => ui.weak(n),
-                        _ => ui.label(RichText::new(n).color(accent)),
-                    };
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(a) = age {
+                            ui.label(RichText::new(age_text(a)).size(13.0).weak()).on_hover_text("How long ago this hint was started");
+                        }
+                        if let Some((icon, spin, word, tip, color)) = &status_info {
+                            let r = ui.label(RichText::new(*word).size(13.0).color(*color));
+                            if *spin {
+                                ui.add(egui::Spinner::new().size(14.0).color(*color)).on_hover_text(tip);
+                            } else if let Some(icon) = icon {
+                                status_icon(ui, *icon, *color).on_hover_text(tip);
+                            }
+                            r.on_hover_text(tip);
+                        }
+                    });
                 });
                 ui.add_space(2.0);
             }
             egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
-                None => {
-                    ui.weak("Select text, then Ctrl+C or right-click to copy");
-                }
+                None => {}
                 Some(h) => {
-                    let age = h.started.map(|t| t.elapsed());
                     let stale = age.is_some_and(|a| a > self.hint_max_age) && h.done;
-                    if age.is_some() {
-                        ctx.request_repaint_after(Duration::from_secs(1));
-                    }
                     // Sources are debugging information: they go to the session log, not here.
-                    if let Some(a) = age {
-                        ui.weak(age_text(a));
-                    }
                     // 2. a big Q instead of the word "Question".
                     if !h.question.is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -339,15 +390,11 @@ impl eframe::App for App {
                             copy_menu(&r, &h.question, &mut self.pending_copy);
                         });
                     }
-                    let amber = Color32::from_rgb(230, 170, 40);
                     let (es_color, en_color) = match (stale, h.own) {
                         (true, _) => (Color32::GRAY, Color32::from_gray(120)),
                         (false, true) => (amber, Color32::LIGHT_BLUE),
                         (false, false) => (ui.visuals().strong_text_color(), Color32::LIGHT_BLUE),
                     };
-                    if h.own {
-                        ui.colored_label(amber, "Generated by the model - not found in your documents");
-                    }
                     if h.done && h.es.is_empty() {
                         // The model broke the Q/ES/EN format: show what it actually said.
                         let msg = if h.raw.trim().is_empty() { "The model returned an empty answer." } else { h.raw.trim() };
@@ -382,12 +429,19 @@ impl eframe::App for App {
                     // Your own speech is only context: smaller, muted, never translated.
                     let me = seg.speaker == Speaker::Me;
                     if me {
-                        let mut es = RichText::new(format!("Me: {}", seg.es)).size(17.0).color(Color32::from_gray(125));
+                        // No "Me:" prefix: an indent with a thin bar on the left marks your own lines.
+                        let mut es = RichText::new(&seg.es).size(17.0).color(Color32::from_gray(125));
                         if seg.partial {
                             es = es.italics();
                         }
-                        let r = ui.label(es);
-                        copy_menu(&r, &seg.es, &mut self.pending_copy);
+                        let top = ui.cursor().top();
+                        let r = ui.horizontal_wrapped(|ui| {
+                            ui.add_space(18.0);
+                            ui.label(es)
+                        });
+                        let bar_x = r.response.rect.left() + 6.0;
+                        ui.painter().line_segment([egui::pos2(bar_x, top + 2.0), egui::pos2(bar_x, r.response.rect.bottom() - 2.0)], egui::Stroke::new(2.0_f32, Color32::from_gray(80)));
+                        copy_menu(&r.inner, &seg.es, &mut self.pending_copy);
                     } else {
                         let mut es = RichText::new(&seg.es).size(24.0).color(ui.visuals().strong_text_color());
                         if seg.partial {
