@@ -2,6 +2,6 @@
 Type=Application
 Name=Assistant
 Comment=Live Spanish subtitles and answer hints for calls
-Exec=assistant
+Exec=assistant-app
 Terminal=false
 Categories=AudioVideo;Utility;

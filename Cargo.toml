@@ -19,7 +19,8 @@ section = "utils"
 # Audio (PulseAudio protocol) and PDF parsing are built into the binary: only libc is needed.
 depends = "$auto"
 assets = [
-  ["target/release/assistant", "usr/bin/", "755"],
+  # Not /usr/bin/assistant: that name belongs to qtchooser (Qt Assistant) on many systems.
+  ["target/release/assistant", "usr/bin/assistant-app", "755"],
   ["packaging/assistant.desktop", "usr/share/applications/", "644"],
   ["README.md", "usr/share/doc/assistant/", "644"],
 ]

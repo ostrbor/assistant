@@ -36,14 +36,14 @@ Download `assistant_X.Y.Z_amd64.deb` from the GitHub Releases page and install i
 
 ```bash
 sudo apt install ./assistant_X.Y.Z_amd64.deb
-assistant            # or start "Assistant" from the applications menu
+assistant-app        # or start "Assistant" from the applications menu
 ```
 
-On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you. The installed `assistant` always uses `~/assistant/config.toml` and `~/assistant/docs/`, whatever the current folder is.
+On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you. The installed `assistant-app` always uses `~/assistant/config.toml` and `~/assistant/docs/`, whatever the current folder is.
 
 **Logs.** When started from the menu (no terminal), warnings and errors are written to `~/assistant/assistant.log` (rotated to `assistant.log.old` at about 1 MB). When started from a terminal, they are printed there instead.
 
-The app updates itself (see *Auto-update* below). `/usr/bin` is read-only for you, so updates are stored in `~/assistant/bin/assistant`, and the installed `assistant` command hands over to that copy automatically. Installing a newer .deb later also works: the newest of the two versions runs. Your `~/assistant/` is kept, also when you remove the package.
+The app updates itself (see *Auto-update* below). `/usr/bin` is read-only for you, so updates are stored in `~/assistant/bin/assistant`, and the installed `assistant-app` command hands over to that copy automatically. Installing a newer .deb later also works: the newest of the two versions runs. Your `~/assistant/` is kept, also when you remove the package. The command is called `assistant-app` because `/usr/bin/assistant` belongs to `qtchooser` (Qt Assistant) on many systems.
 
 ## Install from a release (no Rust needed)
 

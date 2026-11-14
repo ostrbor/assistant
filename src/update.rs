@@ -2,7 +2,7 @@
 //!
 //! * Binary in a writable folder (tar.gz release, `~/assistant/bin`): replaced in place.
 //! * Binary in a read-only folder (the .deb installs to `/usr/bin`): the new version is
-//!   downloaded to `~/assistant/bin/assistant`. On later starts `/usr/bin/assistant` hands
+//!   downloaded to `~/assistant/bin/assistant`. On later starts `/usr/bin/assistant-app` hands
 //!   over to that copy while it is newer than itself, so a newer .deb wins automatically.
 
 use std::os::unix::fs::PermissionsExt;

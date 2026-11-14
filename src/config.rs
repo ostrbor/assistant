@@ -157,11 +157,13 @@ pub fn prepare_workdir() -> Result<std::path::PathBuf> {
     std::env::current_dir().context("cannot determine the working directory")
 }
 
-/// `~/assistant` when `exe` is the .deb installation (`/usr/bin/assistant`) or its auto-update
-/// copy (`~/assistant/bin/assistant`); `None` for development builds and tar.gz releases.
+/// `~/assistant` when `exe` is the .deb installation (`/usr/bin/assistant-app`, or
+/// `/usr/bin/assistant` in versions up to 0.1.3) or its auto-update copy
+/// (`~/assistant/bin/assistant`); `None` for development builds and tar.gz releases.
 fn installed_workdir(exe: &std::path::Path, home: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = home.join("assistant");
-    (exe == std::path::Path::new("/usr/bin/assistant") || exe.parent() == Some(dir.join("bin").as_path())).then_some(dir)
+    let deb = ["/usr/bin/assistant-app", "/usr/bin/assistant"].iter().any(|p| exe == std::path::Path::new(p));
+    (deb || exe.parent() == Some(dir.join("bin").as_path())).then_some(dir)
 }
 
 /// Creates `dir` with `docs/` and a default `config.toml` if they do not exist yet.
@@ -191,6 +193,7 @@ mod tests {
     fn installed_copies_use_home_assistant() {
         let home = Path::new("/home/u");
         let want = Some(home.join("assistant"));
+        assert_eq!(installed_workdir(Path::new("/usr/bin/assistant-app"), home), want);
         assert_eq!(installed_workdir(Path::new("/usr/bin/assistant"), home), want);
         assert_eq!(installed_workdir(Path::new("/home/u/assistant/bin/assistant"), home), want);
     }
