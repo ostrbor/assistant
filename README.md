@@ -124,6 +124,10 @@ Everything is in `config.toml`:
 
 Model and provider names change over time. If you see an HTTP error in the red line under the toolbar, check the name in `config.toml` against the provider's current catalog. To use OpenAI instead of Hugging Face for the LLM, set `base_url = "https://api.openai.com/v1"`, `api_key_env = "OPENAI_API_KEY"` and an OpenAI model name.
 
+## Condensing lesson texts with an AI agent
+
+PDF text extraction loses math symbols that a PDF draws as graphics (∧ ∨ ∪ ∈ …) and keeps a lot of filler. On start the installed app (the `~/assistant` folder) puts a skill, `summarize-lesson-cache`, into `~/assistant/.claude/skills/` and, if there is none, an `AGENTS.md` that points other agents at it. Start Claude Code (or Codex) **inside `~/assistant`** and ask it to summarize a folder, e.g. `/summarize-lesson-cache algebra` or "summarize the algebra lessons". The agent backs up each cache file (`docs/<folder>/.cache-orig/`), keeps terms, definitions and ideas, restores the lost symbols by looking at the PDF page, and checks that the file is still valid for the app (same header line, same pages). Re-select the folder in the app to use the new texts. The skill is refreshed on app updates, so copy it under another name if you want to change it.
+
 ## Cost
 
 Rough figures; check current pricing. Transcription is the main cost, on the order of a few tenths of a dollar per hour of audio sent while *Listen* is on. Silence is not sent, and the microphone is a second stream (only your own speech counts), so the total depends on how much is actually said. Translation and hints send only a few thousand tokens per request, which amounts to cents per call.

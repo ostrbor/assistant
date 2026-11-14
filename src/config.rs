@@ -174,7 +174,46 @@ fn ensure_home_workdir(dir: &std::path::Path) -> Result<()> {
         write_private(&cfg, CONFIG_TEMPLATE).with_context(|| format!("cannot write {}", cfg.display()))?;
         eprintln!("Created {} with a default config.toml and docs/", dir.display());
     }
+    install_agent_files(dir);
     Ok(())
+}
+
+/// Files for AI coding agents started in the working folder: the skill that condenses the lesson
+/// caches (Claude Code reads `.claude/skills`), and an `AGENTS.md` that points other agents
+/// (Codex…) at it.
+const SKILL_DIR: &str = ".claude/skills/summarize-lesson-cache";
+const SKILL_FILES: &[(&str, &str)] = &[
+    ("SKILL.md", include_str!("../packaging/agent/summarize-lesson-cache/SKILL.md")),
+    ("scripts/cache_tool.py", include_str!("../packaging/agent/summarize-lesson-cache/scripts/cache_tool.py")),
+];
+const AGENTS_MD: &str = include_str!("../packaging/agent/AGENTS.md");
+
+/// Copies the skill into `dir` when it is missing or comes from another app version (the skill is
+/// part of the app: copy it under another name to customize it), and creates `AGENTS.md` only
+/// if there is none, so a file of the user is never touched. Best effort: never fails startup.
+fn install_agent_files(dir: &std::path::Path) {
+    let skill = dir.join(SKILL_DIR);
+    let stamp = skill.join(".app-version");
+    let current = env!("CARGO_PKG_VERSION");
+    let write = |path: &std::path::Path, text: &str| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, text)
+    };
+    if std::fs::read_to_string(&stamp).ok().as_deref().map(str::trim) != Some(current) {
+        let res = SKILL_FILES.iter().try_for_each(|(name, text)| write(&skill.join(name), text)).and_then(|()| write(&stamp, current));
+        match res {
+            Ok(()) => eprintln!("Installed the summarize-lesson-cache skill in {}", skill.display()),
+            Err(e) => eprintln!("warning: cannot install the skill in {}: {e}", skill.display()),
+        }
+    }
+    let agents = dir.join("AGENTS.md");
+    if !agents.exists()
+        && let Err(e) = std::fs::write(&agents, AGENTS_MD)
+    {
+        eprintln!("warning: cannot write {}: {e}", agents.display());
+    }
 }
 
 /// Writes a file readable only by the owner (it will hold API keys).
@@ -186,8 +225,39 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::installed_workdir;
+    use super::{AGENTS_MD, SKILL_DIR, install_agent_files, installed_workdir};
     use std::path::Path;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("assistant-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn agent_files_are_installed_and_not_clobbered() {
+        let d = tmp("agent");
+        install_agent_files(&d);
+        let skill = d.join(SKILL_DIR);
+        assert!(std::fs::read_to_string(skill.join("SKILL.md")).unwrap().starts_with("---\nname: summarize-lesson-cache"));
+        assert!(skill.join("scripts/cache_tool.py").exists());
+        assert_eq!(std::fs::read_to_string(d.join("AGENTS.md")).unwrap(), AGENTS_MD);
+
+        // The user's own AGENTS.md is never replaced.
+        std::fs::write(d.join("AGENTS.md"), "mine").unwrap();
+        install_agent_files(&d);
+        assert_eq!(std::fs::read_to_string(d.join("AGENTS.md")).unwrap(), "mine");
+
+        // Same app version: the skill is left alone; another version: it is refreshed.
+        std::fs::write(skill.join("SKILL.md"), "edited").unwrap();
+        install_agent_files(&d);
+        assert_eq!(std::fs::read_to_string(skill.join("SKILL.md")).unwrap(), "edited");
+        std::fs::write(skill.join(".app-version"), "0.0.0").unwrap();
+        install_agent_files(&d);
+        assert!(std::fs::read_to_string(skill.join("SKILL.md")).unwrap().starts_with("---"));
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     #[test]
     fn installed_copies_use_home_assistant() {
