@@ -167,7 +167,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     let shared = Shared::new(None);
     let stop = Arc::new(AtomicBool::new(false));
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
-    core::spawn_capture(&shared, audio::Source::Speakers, audio::threshold(cfg.transcribe.silence_threshold), &stop, audio_tx);
+    core::spawn_capture(&shared, audio::Source::Speakers, audio::threshold(cfg.transcribe.silence_threshold), &stop, audio_tx, None);
     let (ev_tx, _ev_rx) = unbounded_channel();
     let transcribe = {
         let (tcfg, shared, key) = (cfg.transcribe.clone(), shared.clone(), key.clone());

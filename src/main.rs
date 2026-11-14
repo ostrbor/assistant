@@ -7,6 +7,7 @@ mod interview;
 mod llm;
 mod logfile;
 mod realtime;
+mod record;
 mod search;
 mod state;
 mod ui;

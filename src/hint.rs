@@ -54,6 +54,9 @@ fn generate(core: &Arc<Core>, show: bool) {
     let core2 = core.clone();
     let task = tokio::spawn(async move {
         if let Err(e) = run(&core2, show).await {
+            if let Some(r) = core2.rec() {
+                r.error(&format!("Hint: {e}"));
+            }
             core2.shared.update(|s| s.error = Some(format!("Hint: {e}")));
         }
     });
@@ -111,6 +114,9 @@ async fn run(core: &Arc<Core>, show: bool) -> anyhow::Result<()> {
     hint.apply_raw(&text);
     hint.done = true;
     publish(&core.shared, &hint, show);
+    if let Some(r) = core.rec() {
+        r.hint(&hint, show);
+    }
     Ok(())
 }
 

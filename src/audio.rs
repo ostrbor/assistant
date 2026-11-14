@@ -201,6 +201,24 @@ pub fn ensure_virtual_devices(sink: &str, mic: &str) -> Result<()> {
     Ok(())
 }
 
+/// 44-byte header of a 24 kHz s16le mono WAV file with `data_len` bytes of PCM.
+pub fn wav_header(data_len: u32) -> [u8; 44] {
+    let mut h = Vec::with_capacity(44);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(36 + data_len).to_le_bytes());
+    h.extend_from_slice(b"WAVEfmt ");
+    h.extend_from_slice(&16u32.to_le_bytes());
+    h.extend_from_slice(&1u16.to_le_bytes());
+    h.extend_from_slice(&1u16.to_le_bytes());
+    h.extend_from_slice(&RATE.to_le_bytes());
+    h.extend_from_slice(&(RATE * 2).to_le_bytes());
+    h.extend_from_slice(&2u16.to_le_bytes());
+    h.extend_from_slice(&16u16.to_le_bytes());
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data_len.to_le_bytes());
+    h.try_into().unwrap()
+}
+
 /// Records `secs` seconds to a WAV file for checking (`--test-audio`).
 pub fn record_wav(path: &str, secs: u32) -> Result<()> {
     let stop = AtomicBool::new(false);
@@ -211,18 +229,7 @@ pub fn record_wav(path: &str, secs: u32) -> Result<()> {
         pcm.len() < target
     })?;
     let mut wav = Vec::with_capacity(44 + pcm.len());
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&RATE.to_le_bytes());
-    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&wav_header(pcm.len() as u32));
     wav.extend_from_slice(&pcm);
     std::fs::write(path, wav)?;
     Ok(())

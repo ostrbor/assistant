@@ -41,6 +41,8 @@ assistant-app        # or start "Assistant" from the applications menu
 
 On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you. The installed `assistant-app` always uses `~/assistant/config.toml` and `~/assistant/docs/`, whatever the current folder is.
 
+**Session records.** Every Listen → Stop creates `~/assistant/sessions/<date_time>/` with `session.log` (transcript, translations, hints with their sources, errors; times are offsets from the start) and the raw audio `them.wav` (speakers) and `me.wav` (microphone, recorded before the silence filter). They are for debugging and are never deleted automatically (about 170 MB per hour per file).
+
 **Logs.** When started from the menu (no terminal), warnings and errors are written to `~/assistant/assistant.log` (rotated to `assistant.log.old` at about 1 MB). When started from a terminal, they are printed there instead.
 
 The app updates itself (see *Auto-update* below). `/usr/bin` is read-only for you, so updates are stored in `~/assistant/bin/assistant`, and the installed `assistant-app` command hands over to that copy automatically. Installing a newer .deb later also works: the newest of the two versions runs. Your `~/assistant/` is kept, also when you remove the package. The command is called `assistant-app` because `/usr/bin/assistant` belongs to `qtchooser` (Qt Assistant) on many systems.

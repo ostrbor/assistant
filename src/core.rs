@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::llm::Llm;
+use crate::record::{SessionLog, WavWriter};
 use crate::search::Index;
 use crate::state::{Shared, Speaker};
 use crate::{audio, hint, realtime};
@@ -36,6 +37,8 @@ pub struct Core {
     pub index: RwLock<Option<Arc<Index>>>,
     pub llm: Llm,
     pub prep: Mutex<Option<AbortHandle>>,
+    /// Debug record of the current Listen session (text + audio).
+    pub rec: Mutex<Option<Arc<SessionLog>>>,
 }
 
 impl Core {
@@ -45,7 +48,12 @@ impl Core {
             audio::threshold_set(&s.meters[Speaker::Them.idx()].threshold, cfg.transcribe.silence_threshold);
             audio::threshold_set(&s.meters[Speaker::Me.idx()].threshold, cfg.transcribe.mic_silence_threshold);
         });
-        Self { cfg, shared, index: RwLock::new(None), llm, prep: Mutex::new(None) }
+        Self { cfg, shared, index: RwLock::new(None), llm, prep: Mutex::new(None), rec: Mutex::new(None) }
+    }
+
+    /// The record of the current session, if one is open.
+    pub fn rec(&self) -> Option<Arc<SessionLog>> {
+        self.rec.lock().unwrap().clone()
     }
 
     /// Stops a hint that is still being prepared or streamed.
@@ -101,6 +109,9 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
                 Some(Ev::Completed(id)) => on_completed(&core, &id),
                 Some(Ev::Error(e)) => {
                     if session.is_some() {
+                        if let Some(r) = core.rec() {
+                            r.error(&e);
+                        }
                         stop(&mut session, &core);
                         core.shared.update(|s| s.error = Some(e));
                     }
@@ -122,10 +133,33 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
         s.meters.iter_mut().for_each(|m| m.reset());
     });
 
+    // A failure to record must not prevent listening: it is only shown as an error.
+    let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let topic = core.shared.read(|s| s.topic.clone());
+    let rec = match SessionLog::create(&base, &core.cfg, topic.as_deref()) {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            core.shared.update(|s| s.error = Some(format!("Session record: {e:#}")));
+            None
+        }
+    };
+    let wav = |name: &str| {
+        let r = rec.as_ref()?;
+        match r.wav(name) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                r.error(&format!("{name}: {e:#}"));
+                None
+            }
+        }
+    };
+    let (them_wav, me_wav) = (wav("them.wav"), if core.cfg.transcribe.capture_mic { wav("me.wav") } else { None });
+    *core.rec.lock().unwrap() = rec;
+
     let stop = Arc::new(AtomicBool::new(false));
-    let mut tasks = vec![spawn_stream(core, &key, Speaker::Them, audio::Source::Speakers, &stop, ev_tx)];
+    let mut tasks = vec![spawn_stream(core, &key, Speaker::Them, audio::Source::Speakers, &stop, ev_tx, them_wav)];
     if core.cfg.transcribe.capture_mic {
-        tasks.push(spawn_stream(core, &key, Speaker::Me, audio::Source::Mic, &stop, ev_tx));
+        tasks.push(spawn_stream(core, &key, Speaker::Me, audio::Source::Mic, &stop, ev_tx, me_wav));
     }
     Ok(Session { stop, tasks })
 }
@@ -154,7 +188,7 @@ fn start_monitor(core: &Arc<Core>) -> Session {
         .map(|source| {
             let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
             let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
-            spawn_capture(&core.shared, source, threshold, &stop, tx);
+            spawn_capture(&core.shared, source, threshold, &stop, tx, None);
             tokio::spawn(async move { while rx.recv().await.is_some() {} })
         })
         .collect();
@@ -173,8 +207,8 @@ fn stop_monitor(monitor: &mut Option<Session>, core: &Arc<Core>) {
 
 /// Audio capture runs on its own thread (blocking pulse API). If the device goes away
 /// (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
-/// Silence is dropped before the frames are sent to `audio_tx`.
-pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::Threshold, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>) {
+/// Silence is dropped before the frames are sent to `audio_tx`; `wav` gets the raw audio before the gate.
+pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::Threshold, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>, mut wav: Option<WavWriter>) {
     let lost = match source {
         audio::Source::Speakers => "Audio device lost",
         audio::Source::Mic => "Microphone lost",
@@ -193,6 +227,9 @@ pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::T
                             s.status = "Listening".into();
                         }
                     });
+                }
+                if let Some(w) = wav.as_mut() {
+                    w.write(&c);
                 }
                 // An empty result (silence) counts as success; a closed receiver stops the capture.
                 let out = gate.push(c);
@@ -222,10 +259,11 @@ fn spawn_stream(
     source: audio::Source,
     stop: &Arc<AtomicBool>,
     ev_tx: &UnboundedSender<Ev>,
+    wav: Option<WavWriter>,
 ) -> JoinHandle<()> {
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
     let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
-    spawn_capture(&core.shared, source, threshold, stop, audio_tx);
+    spawn_capture(&core.shared, source, threshold, stop, audio_tx, wav);
 
     let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());
     tokio::spawn(async move {
@@ -245,6 +283,9 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
             t.abort();
         }
     }
+    if let Some(r) = core.rec.lock().unwrap().take() {
+        r.stopped();
+    }
     core.shared.update(|s| {
         s.listening = false;
         s.listening_since = None;
@@ -263,6 +304,10 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
         Some((s.segments[idx].speaker, s.segments[idx].es.clone(), ctx.into_iter().rev().collect::<Vec<_>>()))
     });
     let Some((speaker, es, ctx)) = found else { return };
+    let rec = core.rec();
+    if let Some(r) = &rec {
+        r.utterance(item_id, speaker, &es);
+    }
 
     // The user spoke: no translation needed, and a hint prepared before their answer is stale.
     // A hint that is on screen (possibly still streaming) is left alone.
@@ -286,6 +331,9 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
             Ok(t) => t,
             Err(e) => format!("[translation error: {e}]"),
         };
+        if let Some(r) = &rec {
+            r.translation(&id, &en);
+        }
         core2.shared.update(|s| {
             if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == id) {
                 seg.en = Some(en);
