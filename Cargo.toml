@@ -2,7 +2,7 @@
 name = "assistant"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [features]
 # Enabled only for release builds: check GitHub Releases for a newer binary at startup.

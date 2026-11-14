@@ -26,7 +26,7 @@ microphone ──────► default input ──────┴► OpenAI R
 ## Requirements
 
 - Ubuntu 22.04 or newer (or another Linux with glibc ≥ 2.35) with PipeWire or PulseAudio (the app records the default output's `.monitor` source via `pactl`)
-- Rust ≥ 1.85 via `rustup` (the apt `rustc` on Ubuntu 22.04 is too old). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`.
+- Rust ≥ 1.88 via `rustup` (the apt `rustc` on Ubuntu is too old). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`.
 - Development packages and tools:
   ```bash
   # Debian / Ubuntu
@@ -167,7 +167,8 @@ Notes:
 - **The other person's words appear as `Me:`.** Their voice leaks from the speakers into your microphone. Use headphones.
 - **Subtitles cut off quiet speech, or the stream never goes quiet.** Tune `silence_threshold` / `mic_silence_threshold`.
 - **`LLM timed out`.** The provider gave no first token within 15 s (or went quiet for 20 s). Press *Hint* again or check the provider.
-- **`environment variable … is not set`.** Export `OPENAI_API_KEY` and `HF_TOKEN` in the shell that launches the app.
+- **`environment variable OPENAI_API_KEY is not set`.** Export `OPENAI_API_KEY` in the shell that launches the app.
+- **`LLM token is not set`** (hint error, or `[translation error: …]` under subtitles). Export `HF_TOKEN` (or the variable named in `[llm] api_key_env`) in the shell that launches the app.
 - **`Transcription: HTTP error: 401`.** The OpenAI key is invalid or has no access to the Realtime API. The app stops instead of retrying.
 - **Translation shows `[translation error: …]`.** Check `HF_TOKEN`, your credits, and the model name in `config.toml`.
 - **`No text found in <folder>`.** The PDFs are scans without a text layer.
