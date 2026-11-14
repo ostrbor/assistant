@@ -3,7 +3,7 @@
 A small desktop window for Linux that helps you follow a Spanish-language call (Zoom, Google Meet or anything else that plays through your speakers):
 
 - **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with an English translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
-- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. If the other person's sentence looks like a question, the hint is prepared in the background, so it is usually already there when you press the button.
+- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. The hint also appears by itself: ~1.2 s after the other person stops talking, the model checks whether they asked something and, if so, the hint streams into the panel. A status line above the hint says what is happening (*They are speaking…*, *Checking whether that was a question…*, *Writing the hint…*, *No question in what they just said*), so you know whether to wait or press *Hint*.
 
 The window stays on top of other windows. The other person is captured from what plays through the speakers, you from your default microphone. **Use headphones**: through speakers, their voice leaks into your microphone and shows up as `Me:` lines. To turn the microphone off, set `capture_mic = false`.
 
@@ -103,7 +103,7 @@ cargo run --release -- --topic project_x     # preselect a document folder
 | Control | Action |
 |---|---|
 | **Listen / Stop** | Start or stop capturing and transcribing. Nothing is sent while stopped. |
-| **Hint** | Show the answer hint for the latest question. |
+| **Hint** | Get a hint right now (or a new one); hints also appear by themselves after each question. |
 | **Docs** drop-down | Choose which folder under `docs/` to answer from. You can switch at any time; the index rebuilds in a moment. |
 | **↻** | Rescan `docs/` after adding a folder. |
 | **Clear** | Clear the transcript, hint and errors. |
@@ -123,7 +123,9 @@ Everything is in `config.toml`:
 | `docs_dir` | Root folder that contains the per-call subfolders. |
 | `hint_window_secs` | How much recent speech the hint generator sees (default 60). |
 | `hint_chunks` | How many of the best matching excerpts of your documents the hint generator sees (default 8, each up to 200 words). |
-| `hint_max_age_secs` | A hint prepared in the background older than this is regenerated when you press *Hint* (default 20). |
+| `hint_max_age_secs` | A hint on screen older than this is greyed out (default 20). |
+| `hint_auto` | `true` (default) shows a hint by itself after each turn of the other person; `false` means only the *Hint* button. |
+| `hint_auto_delay_ms` | Quiet time after the other person's last phrase before the automatic hint starts (default 1200). |
 | `[transcribe] api_key` | OpenAI API key. If empty, the variable named in `api_key_env` is used. |
 | `[llm] api_key` | Key of the LLM endpoint (Hugging Face token by default). If empty, the variable named in `api_key_env` is used. |
 | `[transcribe] model, language` | Realtime transcription model and the spoken language. |

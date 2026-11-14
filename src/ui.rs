@@ -1,6 +1,6 @@
 use crate::core::Cmd;
 use crate::docs::FileStatus;
-use crate::state::{AppState, AudioMeter, DocsReport, METER_FRAMES, Shared, Speaker};
+use crate::state::{AppState, AudioMeter, DocsReport, HintStatus, METER_FRAMES, Shared, Speaker};
 use eframe::egui::{self, Align, Color32, RichText};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -112,8 +112,7 @@ impl eframe::App for App {
             error,
             conn_error,
             hint,
-            pending,
-            pending_shown,
+            hint_status,
             topics,
             topic,
             docs_report,
@@ -124,10 +123,6 @@ impl eframe::App for App {
             cost_report,
             cost_open,
         } = self.shared.read(AppState::clone);
-
-        // A hint prepared in the background and not shown yet: tell the user it is ready.
-        let ready = !pending_shown && pending.as_ref().is_some_and(|p| p.started.is_some_and(|t| t.elapsed() < self.hint_max_age));
-        let preparing = ready && pending.as_ref().is_some_and(|p| !p.done);
 
         let mut dismiss_error = false;
         let mut top = egui::TopBottomPanel::top("top");
@@ -151,16 +146,9 @@ impl eframe::App for App {
                 if icon_button(ui, Some(icon), label, Some(fill), Some(Color32::WHITE), btn_size).clicked() {
                     self.send(if listening { Cmd::Stop } else { Cmd::Start });
                 }
-                let hint_btn = if ready {
-                    icon_button(ui, Some(Icon::Dot), "Hint", Some(Color32::from_rgb(40, 140, 70)), Some(Color32::WHITE), btn_size)
-                } else {
-                    icon_button(ui, None, "Hint", None, None, btn_size)
-                };
-                if hint_btn.on_hover_text("Show the hint; press again for a new one").clicked() {
+                let hint_btn = icon_button(ui, None, "Hint", None, None, btn_size);
+                if hint_btn.on_hover_text("Get a hint right now (or a new one). Hints also appear by themselves after each question.").clicked() {
                     self.send(Cmd::AskHint);
-                }
-                if preparing {
-                    ui.spinner();
                 }
                 let armed = self.clear_armed.is_some_and(|t| t.elapsed() < CLEAR_CONFIRM);
                 if !armed {
@@ -306,10 +294,32 @@ impl eframe::App for App {
             let top = ui.max_rect().top() - 12.0;
             ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(screen.left(), top), egui::pos2(screen.right(), top + 4.0)), 0.0, accent);
             ui.add_space(2.0);
+            // Always say what is going on, so it is clear whether to wait or press Hint.
+            let busy = matches!(hint_status, HintStatus::Listening | HintStatus::Checking | HintStatus::Writing);
+            let note = match &hint_status {
+                HintStatus::Listening => Some("They are speaking…".to_string()),
+                HintStatus::Checking => Some("Checking whether that was a question…".to_string()),
+                HintStatus::Writing => Some("Writing the hint…".to_string()),
+                HintStatus::NoQuestion => Some("No question in what they just said. Press Hint to get an answer anyway.".to_string()),
+                HintStatus::Error(e) => Some(e.clone()),
+                HintStatus::Idle => hint.is_none().then(|| "Hints appear here by themselves after each question. Press Hint to ask now.".to_string()),
+            };
+            if let Some(n) = note {
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                    }
+                    match &hint_status {
+                        HintStatus::Error(_) => ui.colored_label(Color32::LIGHT_RED, n),
+                        HintStatus::Idle => ui.weak(n),
+                        _ => ui.label(RichText::new(n).color(accent)),
+                    };
+                });
+                ui.add_space(2.0);
+            }
             egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
                 None => {
-                    ui.weak("The hint will appear here (Hint button).")
-                        .on_hover_text("Select text, then Ctrl+C or right-click to copy");
+                    ui.weak("Select text, then Ctrl+C or right-click to copy");
                 }
                 Some(h) => {
                     let age = h.started.map(|t| t.elapsed());

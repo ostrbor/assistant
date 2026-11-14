@@ -4,8 +4,15 @@ docs_dir = "docs"
 # How many seconds of recent speech to give the hint generator
 hint_window_secs = 60
 
-# After how many seconds a hint prepared in the background counts as stale
+# After how many seconds a hint on screen is greyed out as old
 hint_max_age_secs = 20
+
+# Show a hint by itself after every turn of the other person (the model says "no question" when
+# there is none). Set to false to get hints only with the Hint button.
+hint_auto = true
+
+# Quiet time (ms) after the other person's last phrase before the automatic hint starts
+hint_auto_delay_ms = 1200
 
 # How many of the best matching excerpts of your documents the hint generator gets
 # (each is up to 200 words). More excerpts: fewer "not found" cases, a slower and costlier hint.

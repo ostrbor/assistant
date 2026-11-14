@@ -74,6 +74,32 @@ impl Hint {
         (self.question, self.es, self.en) = (question, es, en);
         self.own = src.trim().to_uppercase().starts_with("OWN");
     }
+
+    /// The model answered `NONE`: there was no question to answer.
+    pub fn is_none(&self) -> bool {
+        self.es.is_empty() && self.raw.trim_start().to_uppercase().starts_with("NONE")
+    }
+
+    /// The parsed text has something worth showing.
+    pub fn has_content(&self) -> bool {
+        !self.es.is_empty() || !self.question.is_empty()
+    }
+}
+
+/// What the hint machinery is doing; the hint panel tells the user so they know whether to wait.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub enum HintStatus {
+    #[default]
+    Idle,
+    /// The other person is speaking (an automatic hint will follow the turn).
+    Listening,
+    /// The turn ended; waiting a moment in case they go on, then asking the model.
+    Checking,
+    /// The model is writing the hint.
+    Writing,
+    /// The model found no question in the last phrases.
+    NoQuestion,
+    Error(String),
 }
 
 #[derive(Clone, Default)]
@@ -140,9 +166,8 @@ pub struct AppState {
     pub log_path: Option<std::path::PathBuf>,
     /// Hint currently shown to the user.
     pub hint: Option<Hint>,
-    /// Hint prepared in the background (shown on button press).
-    pub pending: Option<Hint>,
-    pub pending_shown: bool,
+    /// What the hint machinery is doing right now (shown above the hint).
+    pub hint_status: HintStatus,
     /// Document folders (subfolders of docs_dir) and the selected one.
     pub topics: Vec<String>,
     pub topic: Option<String>,
@@ -196,6 +221,15 @@ mod tests {
         assert!(!h.own);
         h.apply_raw("SRC: O");
         assert!(!h.own);
+    }
+
+    #[test]
+    fn none_answer_is_detected() {
+        let mut h = Hint::default();
+        h.apply_raw("NONE");
+        assert!(h.is_none() && !h.has_content());
+        h.apply_raw("SRC: OWN\nQ: x\nES: hola\nEN: hi");
+        assert!(!h.is_none() && h.has_content());
     }
 
     #[test]
