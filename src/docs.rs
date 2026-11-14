@@ -38,8 +38,37 @@ pub fn topic_dir(docs_dir: &str, topic: &str) -> Result<PathBuf> {
     Ok(Path::new(docs_dir).join(topic))
 }
 
-/// Reads all PDFs in a folder (.txt cache next to each file) and splits them into chunks.
-pub fn load_chunks(dir: &Path) -> Result<Vec<Chunk>> {
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileStatus {
+    Ok,
+    Warn(String),
+    Failed(String),
+}
+
+/// How well one PDF was parsed.
+#[derive(Debug, Clone)]
+pub struct FileReport {
+    pub name: String,
+    pub pages: usize,
+    pub chunks: usize,
+    pub status: FileStatus,
+}
+
+/// True when letters are under half of the non-whitespace characters (broken font encoding).
+fn looks_garbled(text: &str) -> bool {
+    let (mut letters, mut total) = (0usize, 0usize);
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        total += 1;
+        if c.is_alphabetic() {
+            letters += 1;
+        }
+    }
+    total >= 200 && letters * 2 < total
+}
+
+/// Reads all PDFs in a folder (.txt cache next to each file), splits them into chunks
+/// and reports how well each file was parsed.
+pub fn load_chunks(dir: &Path) -> Result<(Vec<Chunk>, Vec<FileReport>)> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("document folder not found: {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -48,32 +77,52 @@ pub fn load_chunks(dir: &Path) -> Result<Vec<Chunk>> {
     paths.sort();
 
     let mut chunks = Vec::new();
+    let mut reports = Vec::new();
     let mut loaded = 0;
     let mut last_err = None;
     for p in &paths {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
         let text = match pdf_text(p) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("skip {}: {e:#}", p.display());
+                reports.push(FileReport { name, pages: 0, chunks: 0, status: FileStatus::Failed(format!("{e:#}")) });
                 last_err = Some(e);
                 continue;
             }
         };
         loaded += 1;
-        let name = p.file_name().unwrap().to_string_lossy().to_string();
         let before = chunks.len();
         // pages are separated by a form feed character
+        let mut pages = 0;
+        let mut empty = 0;
         for (i, page) in text.split('\u{c}').enumerate() {
+            pages += 1;
+            if page.trim().is_empty() {
+                empty += 1;
+            }
             chunk_page(&name, i + 1, page, &mut chunks);
         }
-        if chunks.len() == before {
-            eprintln!("warning: {name} has no text layer (scanned PDF? OCR needed)");
+        let n = chunks.len() - before;
+        let status = if n == 0 {
+            FileStatus::Warn("no text layer (scanned PDF? OCR needed)".into())
+        } else if looks_garbled(&text) {
+            FileStatus::Warn("text looks garbled (broken font encoding?)".into())
+        } else if empty > 0 {
+            FileStatus::Warn(format!("{empty} of {pages} pages have no text"))
+        } else {
+            FileStatus::Ok
+        };
+        match &status {
+            FileStatus::Warn(m) | FileStatus::Failed(m) => eprintln!("warning: {name}: {m}"),
+            FileStatus::Ok => {}
         }
+        reports.push(FileReport { name, pages, chunks: n, status });
     }
     if loaded == 0 && let Some(e) = last_err {
         return Err(e);
     }
-    Ok(chunks)
+    Ok((chunks, reports))
 }
 
 const CACHE_VERSION: &str = "v1";
@@ -221,6 +270,13 @@ mod tests {
         let c = chunks_of(&words(201));
         assert_eq!(c.len(), 2);
         assert!(c[1].text.starts_with("w160 "));
+    }
+
+    #[test]
+    fn garbled_text_is_detected() {
+        assert!(looks_garbled(&"\u{2}\u{3}1#% ".repeat(100)));
+        assert!(!looks_garbled(&"hello world ".repeat(100)));
+        assert!(!looks_garbled("12 34"));
     }
 
     #[test]

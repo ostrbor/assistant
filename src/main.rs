@@ -22,7 +22,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let workdir = config::prepare_workdir()?;
-    logfile::redirect_stderr(&workdir);
+    let log_path = logfile::redirect_stderr(&workdir);
     #[cfg(feature = "updater")]
     update::check_and_restart();
     let cfg = Arc::new(config::Config::load("config.toml")?);
@@ -51,7 +51,11 @@ fn main() -> Result<()> {
 
     if has("--test-search") {
         let topic = topic_arg.ok_or_else(|| anyhow!("usage: --test-search --topic <name> \"question\""))?;
-        let index = search::Index::build(docs::load_chunks(&docs::topic_dir(&cfg.docs_dir, &topic)?)?);
+        let (chunks, report) = docs::load_chunks(&docs::topic_dir(&cfg.docs_dir, &topic)?)?;
+        for r in &report {
+            eprintln!("{:?} {} ({} pages, {} chunks)", r.status, r.name, r.pages, r.chunks);
+        }
+        let index = search::Index::build(chunks);
         eprintln!("Indexed chunks: {}", index.len());
         let q = args.last().map(String::as_str).unwrap_or("");
         for (score, c) in index.search(&[(q, 1.0)], 5) {
@@ -103,6 +107,7 @@ fn main() -> Result<()> {
                     (k, t) => k.or(t),
                 };
                 s.topics = topics;
+                s.log_path = log_path;
             });
             let core = Arc::new(core::Core::new(cfg, shared.clone()));
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();

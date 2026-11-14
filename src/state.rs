@@ -65,6 +65,12 @@ impl Hint {
 }
 
 #[derive(Clone, Default)]
+pub struct DocsReport {
+    pub files: Vec<crate::docs::FileReport>,
+    pub chunks: usize,
+}
+
+#[derive(Clone, Default)]
 pub struct AppState {
     pub segments: Vec<Segment>,
     pub listening: bool,
@@ -74,8 +80,10 @@ pub struct AppState {
     pub error: Option<String>,
     /// Connection problem; cleared on reconnect and on Stop, never touches `error`.
     pub conn_error: Option<String>,
-    /// Extra info about the selected folder, e.g. "42 chunks".
-    pub topic_info: Option<String>,
+    /// Parse results of the selected folder.
+    pub docs_report: Option<DocsReport>,
+    /// Log file, when stderr is redirected to one.
+    pub log_path: Option<std::path::PathBuf>,
     /// Hint currently shown to the user.
     pub hint: Option<Hint>,
     /// Hint prepared in the background (shown on button press).

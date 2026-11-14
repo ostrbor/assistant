@@ -144,7 +144,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     let key = cfg.transcribe.key()?;
 
     let dir = docs::topic_dir(&cfg.docs_dir, topic)?;
-    let chunks = tokio::task::spawn_blocking(move || docs::load_chunks(&dir)).await??;
+    let chunks = tokio::task::spawn_blocking(move || docs::load_chunks(&dir)).await??.0;
     anyhow::ensure!(!chunks.is_empty(), "no text found in docs/{topic} (scanned PDFs are not supported)");
     let mut docs_text = String::new();
     for c in &chunks {

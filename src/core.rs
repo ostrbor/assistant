@@ -247,7 +247,7 @@ pub fn refresh_topics(core: &Arc<Core>) {
         Ok(topics) => core.shared.update(|s| {
             if s.topic.as_ref().is_some_and(|t| !topics.contains(t)) {
                 s.topic = None;
-                s.topic_info = None;
+                s.docs_report = None;
             }
             s.topics = topics;
         }),
@@ -263,14 +263,14 @@ fn select_topic(core: &Arc<Core>, topic: String) {
     };
     core.shared.update(|s| {
         s.topic_loading = true;
-        s.topic_info = None;
+        s.docs_report = None;
         s.error = None;
     });
     let core2 = core.clone();
     tokio::spawn(async move {
-        let built = tokio::task::spawn_blocking(move || crate::docs::load_chunks(&dir).map(Index::build)).await;
+        let built = tokio::task::spawn_blocking(move || crate::docs::load_chunks(&dir).map(|(c, r)| (Index::build(c), r))).await;
         match built.map_err(anyhow::Error::from).and_then(|r| r) {
-            Ok(index) => {
+            Ok((index, files)) => {
                 let n = index.len();
                 *core2.index.write().unwrap() = Some(Arc::new(index));
                 // A hint prepared from the previous folder is no longer valid.
@@ -280,7 +280,7 @@ fn select_topic(core: &Arc<Core>, topic: String) {
                     s.topic_loading = false;
                     s.pending = None;
                     s.hint = None;
-                    s.topic_info = Some(format!("{n} chunks"));
+                    s.docs_report = Some(crate::state::DocsReport { files, chunks: n });
                     if n == 0 {
                         s.error = Some(format!("No text found in {topic} (scanned PDFs are not supported)"));
                     }

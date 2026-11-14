@@ -1,5 +1,6 @@
 use crate::core::Cmd;
-use crate::state::{AppState, Shared, Speaker};
+use crate::docs::FileStatus;
+use crate::state::{AppState, DocsReport, Shared, Speaker};
 use eframe::egui::{self, Align, Color32, RichText};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,11 +16,14 @@ pub struct App {
     clear_armed: Option<Instant>,
     /// Jump to the newest line on the next frame.
     to_bottom: bool,
+    show_report: bool,
+    /// Identifies the report that was last auto-opened, so it pops up once per load.
+    report_seen: Option<(Option<String>, usize, usize)>,
 }
 
 impl App {
     pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration) -> Self {
-        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false }
+        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false, show_report: false, report_seen: None }
     }
 
     fn send(&self, c: Cmd) {
@@ -89,7 +93,8 @@ impl eframe::App for App {
             pending_shown,
             topics,
             topic,
-            topic_info,
+            docs_report,
+            log_path,
             topic_loading: loading,
         } = self.shared.read(AppState::clone);
 
@@ -159,8 +164,6 @@ impl eframe::App for App {
                 });
                 if loading {
                     ui.spinner();
-                } else if let Some(info) = &topic_info {
-                    ui.weak(info);
                 }
                 if ui.button("↻").on_hover_text("Rescan the docs folder").clicked() {
                     self.send(Cmd::RefreshTopics);
@@ -194,6 +197,56 @@ impl eframe::App for App {
         });
         if dismiss_error {
             self.shared.update(|s| s.error = None);
+        }
+
+        // Docs parse quality (left) and log link (right) at the very bottom.
+        let problems = docs_report.as_ref().map_or(0, |r| r.files.iter().filter(|f| f.status != FileStatus::Ok).count());
+        if let Some(r) = docs_report.as_ref().filter(|_| !loading) {
+            let key = (topic.clone(), r.chunks, r.files.len());
+            if self.report_seen.as_ref() != Some(&key) {
+                self.report_seen = Some(key);
+                if problems > 0 {
+                    self.show_report = true;
+                }
+            }
+        }
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if loading {
+                    ui.spinner();
+                    ui.weak("Loading documents…");
+                } else if let Some(r) = &docs_report {
+                    let failed = r.files.iter().any(|f| matches!(f.status, FileStatus::Failed(_)));
+                    let (color, text) = if problems == 0 {
+                        (Color32::from_rgb(60, 180, 90), format!("{} PDFs OK · {} chunks", r.files.len(), r.chunks))
+                    } else {
+                        let c = if failed { Color32::LIGHT_RED } else { Color32::from_rgb(230, 170, 40) };
+                        (c, format!("{problems} of {} PDFs with problems · {} chunks", r.files.len(), r.chunks))
+                    };
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, color);
+                    let resp = ui.add(egui::Label::new(RichText::new(text).color(color)).sense(egui::Sense::click()));
+                    if resp.on_hover_text("Click to show the per-file report").clicked() {
+                        self.show_report = !self.show_report;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| match &log_path {
+                    Some(path) => {
+                        if ui.link("Open log").on_hover_text(path.display().to_string()).clicked() {
+                            let res = std::process::Command::new("xdg-open").arg(path).spawn();
+                            if let Err(e) = res {
+                                self.shared.update(|s| s.error = Some(format!("Cannot open {}: {e}", path.display())));
+                            }
+                        }
+                    }
+                    None => {
+                        ui.weak("Log: terminal");
+                    }
+                });
+            });
+        });
+        if self.show_report && let Some(r) = &docs_report {
+            report_window(ctx, r, &mut self.show_report);
         }
 
         egui::TopBottomPanel::bottom("hint").resizable(true).min_height(130.0).show(ctx, |ui| {
@@ -277,4 +330,29 @@ impl eframe::App for App {
             }
         });
     }
+}
+
+fn report_window(ctx: &egui::Context, r: &DocsReport, open: &mut bool) {
+    egui::Window::new("Document report").open(open).default_width(520.0).show(ctx, |ui| {
+        egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+            egui::Grid::new("report").num_columns(4).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                ui.strong("File");
+                ui.strong("Pages");
+                ui.strong("Chunks");
+                ui.strong("Status");
+                ui.end_row();
+                for f in &r.files {
+                    ui.label(&f.name);
+                    ui.label(f.pages.to_string());
+                    ui.label(f.chunks.to_string());
+                    match &f.status {
+                        FileStatus::Ok => ui.colored_label(Color32::from_rgb(60, 180, 90), "OK"),
+                        FileStatus::Warn(m) => ui.colored_label(Color32::from_rgb(230, 170, 40), m),
+                        FileStatus::Failed(m) => ui.colored_label(Color32::LIGHT_RED, format!("failed: {m}")),
+                    };
+                    ui.end_row();
+                }
+            });
+        });
+    });
 }
