@@ -39,7 +39,7 @@ sudo apt install ./assistant_X.Y.Z_amd64.deb
 assistant            # or start "Assistant" from the applications menu
 ```
 
-On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you.
+On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you. The installed `assistant` always uses `~/assistant/config.toml` and `~/assistant/docs/`, whatever the current folder is.
 
 **Logs.** When started from the menu (no terminal), warnings and errors are written to `~/assistant/assistant.log` (rotated to `assistant.log.old` at about 1 MB). When started from a terminal, they are printed there instead.
 
@@ -154,7 +154,7 @@ LLM text ─► TTS ─► sink "interviewer_out"                      ┌► as
 your voice ◄─ Zoom/Meet output ◄─ default sink .monitor ─► realtime transcription ─► LLM
 ```
 
-On machine B (Linux with PipeWire/PulseAudio, a graphical session, the same `config.toml`, `docs/<topic>`, `OPENAI_API_KEY` and `HF_TOKEN`):
+On machine B (Linux with PipeWire/PulseAudio and a graphical session; with the app installed, the keys and `docs/<topic>` come from `~/assistant`):
 
 ```bash
 ./assistant --interview --topic demo --persona persona.md --questions 5

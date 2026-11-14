@@ -133,19 +133,22 @@ const CONFIG_TEMPLATE: &str = include_str!("../config.toml");
 /// `~/assistant`, created with a default config on first run (.deb install).
 pub fn prepare_workdir() -> Result<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
-    if !Path::new("config.toml").exists() {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // An installed copy (.deb) always works from ~/assistant, whatever the current folder is.
+    let installed = match (std::env::current_exe().ok(), &home) {
+        (Some(exe), Some(home)) => installed_workdir(&exe, home),
+        _ => None,
+    };
+    if let Some(dir) = installed {
+        ensure_home_workdir(&dir)?;
+        std::env::set_current_dir(&dir).with_context(|| format!("cannot enter {}", dir.display()))?;
+    } else if !Path::new("config.toml").exists() {
         let beside_exe = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from)).filter(|d| d.join("config.toml").exists());
         let dir = match beside_exe {
             Some(d) => d,
             None => {
-                let home = std::env::var_os("HOME").context("HOME is not set")?;
-                let dir = Path::new(&home).join("assistant");
-                std::fs::create_dir_all(dir.join("docs")).with_context(|| format!("cannot create {}", dir.display()))?;
-                let cfg = dir.join("config.toml");
-                if !cfg.exists() {
-                    write_private(&cfg, CONFIG_TEMPLATE).with_context(|| format!("cannot write {}", cfg.display()))?;
-                    eprintln!("Created {} with a default config.toml and docs/", dir.display());
-                }
+                let dir = home.context("HOME is not set")?.join("assistant");
+                ensure_home_workdir(&dir)?;
                 dir
             }
         };
@@ -154,9 +157,49 @@ pub fn prepare_workdir() -> Result<std::path::PathBuf> {
     std::env::current_dir().context("cannot determine the working directory")
 }
 
+/// `~/assistant` when `exe` is the .deb installation (`/usr/bin/assistant`) or its auto-update
+/// copy (`~/assistant/bin/assistant`); `None` for development builds and tar.gz releases.
+fn installed_workdir(exe: &std::path::Path, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = home.join("assistant");
+    (exe == std::path::Path::new("/usr/bin/assistant") || exe.parent() == Some(dir.join("bin").as_path())).then_some(dir)
+}
+
+/// Creates `dir` with `docs/` and a default `config.toml` if they do not exist yet.
+fn ensure_home_workdir(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir.join("docs")).with_context(|| format!("cannot create {}", dir.display()))?;
+    let cfg = dir.join("config.toml");
+    if !cfg.exists() {
+        write_private(&cfg, CONFIG_TEMPLATE).with_context(|| format!("cannot write {}", cfg.display()))?;
+        eprintln!("Created {} with a default config.toml and docs/", dir.display());
+    }
+    Ok(())
+}
+
 /// Writes a file readable only by the owner (it will hold API keys).
 fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?.write_all(text.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::installed_workdir;
+    use std::path::Path;
+
+    #[test]
+    fn installed_copies_use_home_assistant() {
+        let home = Path::new("/home/u");
+        let want = Some(home.join("assistant"));
+        assert_eq!(installed_workdir(Path::new("/usr/bin/assistant"), home), want);
+        assert_eq!(installed_workdir(Path::new("/home/u/assistant/bin/assistant"), home), want);
+    }
+
+    #[test]
+    fn dev_and_tarball_builds_are_not_installed() {
+        let home = Path::new("/home/u");
+        assert_eq!(installed_workdir(Path::new("/repo/target/release/assistant"), home), None);
+        assert_eq!(installed_workdir(Path::new("/opt/x/assistant"), home), None);
+        assert_eq!(installed_workdir(Path::new("/home/u/assistant/assistant"), home), None);
+    }
 }

@@ -21,6 +21,8 @@ fn main() -> Result<()> {
         println!("assistant {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Relative paths in arguments (e.g. `--persona`) are relative to where the user started us.
+    let launch_dir = std::env::current_dir()?;
     let workdir = config::prepare_workdir()?;
     let log_path = logfile::redirect_stderr(&workdir);
     #[cfg(feature = "updater")]
@@ -71,7 +73,7 @@ fn main() -> Result<()> {
         }
         let topic = topic_arg.ok_or_else(|| anyhow!("usage: --interview --topic <name> [--persona <file>] [--questions N]"))?;
         let persona = flag("--persona")
-            .map(|p| std::fs::read_to_string(p).map_err(|e| anyhow!("cannot read {p}: {e}")))
+            .map(|p| std::fs::read_to_string(launch_dir.join(p)).map_err(|e| anyhow!("cannot read {p}: {e}")))
             .transpose()?
             .map(|t| t.trim().to_string());
         let questions = flag("--questions").map(|q| q.parse::<usize>().map_err(|_| anyhow!("--questions needs a number"))).transpose()?;
