@@ -64,40 +64,46 @@ pub fn check_and_restart() {
     }
 }
 
+/// Latest release version, read from the redirect of `github.com/<owner>/<repo>/releases/latest`.
+/// Unlike api.github.com this is not subject to the 60 requests/hour per-IP limit.
+fn latest_version(client: &reqwest::blocking::Client) -> Res<String> {
+    let resp = client.get(format!("https://github.com/{OWNER}/{REPO}/releases/latest")).send()?;
+    if !resp.status().is_redirection() {
+        return Err(format!("GitHub returned {}", resp.status()).into());
+    }
+    let loc = resp.headers().get(reqwest::header::LOCATION).ok_or("no redirect from GitHub")?.to_str()?;
+    let tag = loc.rsplit_once("/tag/").ok_or("no release found")?.1;
+    Ok(tag.trim_start_matches('v').to_string())
+}
+
 /// Returns the new version and the binary to restart into.
 fn try_update(exe: &Path) -> Res<Option<(String, PathBuf)>> {
-    let updater = self_update::backends::github::Update::configure()
-        .repo_owner(OWNER)
-        .repo_name(REPO)
-        .bin_name(BIN)
-        .target(TARGET)
-        .current_version(VERSION)
-        .no_confirm(true)
-        .show_download_progress(false)
-        .show_output(false)
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!("{BIN}/{VERSION}"))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
-    if exe.parent().is_some_and(dir_writable) {
-        let status = updater.update()?;
-        return Ok(status.updated().then(|| (status.version().to_string(), exe.to_path_buf())));
-    }
-    // Read-only installation: put the new binary into the user's folder.
-    let dest = user_bin().ok_or("HOME is not set")?;
-    let release = updater.get_latest_release()?;
-    if !self_update::version::bump_is_greater(VERSION, &release.version)? {
+    let latest = latest_version(&client)?;
+    if !self_update::version::bump_is_greater(VERSION, &latest)? {
         return Ok(None);
     }
-    let asset = release.asset_for(TARGET, None).ok_or("the release has no binary for this platform")?;
+    // Writable folder: replace in place. Read-only (.deb in /usr/bin): use the user's folder.
+    let dest = match exe.parent() {
+        Some(dir) if dir_writable(dir) => exe.to_path_buf(),
+        _ => user_bin().ok_or("HOME is not set")?,
+    };
     let dir = dest.parent().ok_or("bad install path")?;
     std::fs::create_dir_all(dir)?;
     let tmp = self_update::TempDir::new_in(dir)?;
-    let archive = tmp.path().join(&asset.name);
-    let mut headers = updater.api_headers(&updater.auth_token())?;
-    headers.insert(reqwest::header::ACCEPT, "application/octet-stream".parse()?);
-    self_update::Download::from_url(&asset.download_url).set_headers(headers).download_to(&mut std::fs::File::create(&archive)?)?;
+    let name = format!("{BIN}-v{latest}-{TARGET}.tar.gz");
+    let archive = tmp.path().join(&name);
+    let url = format!("https://github.com/{OWNER}/{REPO}/releases/download/v{latest}/{name}");
+    self_update::Download::from_url(&url).download_to(&mut std::fs::File::create(&archive)?)?;
     self_update::Extract::from_source(&archive).extract_file(tmp.path(), BIN)?;
     let new_bin = tmp.path().join(BIN);
     std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755))?;
     // Same filesystem, so this replaces the old copy atomically (even if it is running).
     std::fs::rename(&new_bin, &dest)?;
-    Ok(Some((release.version, dest)))
+    Ok(Some((latest, dest)))
 }
