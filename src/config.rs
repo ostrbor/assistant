@@ -85,7 +85,7 @@ fn default_hint_auto_delay_ms() -> u64 {
 }
 
 fn default_hint_chunks() -> usize {
-    8
+    12
 }
 
 fn default_true() -> bool {

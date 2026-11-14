@@ -96,15 +96,20 @@ pub fn load_chunks(dir: &Path) -> Result<(Vec<Chunk>, Vec<FileReport>)> {
         // pages are separated by a form feed character
         let mut pages = 0;
         let mut empty = 0;
+        let mut placeholders = 0;
         for (i, page) in text.split('\u{c}').enumerate() {
             pages += 1;
             if page.trim().is_empty() {
                 empty += 1;
+            } else if is_placeholder(page) {
+                // A one-line note left by the summarizer: keep the page number, skip the search.
+                placeholders += 1;
+                continue;
             }
             chunk_page(&name, i + 1, page, &mut chunks);
         }
         let n = chunks.len() - before;
-        let status = if n == 0 {
+        let status = if n == 0 && placeholders == 0 {
             FileStatus::Warn("no text layer (scanned PDF? OCR needed)".into())
         } else if looks_garbled(&text) {
             FileStatus::Warn("text looks garbled (broken font encoding?)".into())
@@ -223,6 +228,22 @@ fn normalize(text: &str) -> String {
     out
 }
 
+/// One-line stub such as "Ejercicios de práctica (sin teoría nueva)." or "Ver p.6.".
+/// Short but topical, so BM25 would rank it high while it carries nothing.
+fn is_placeholder(page: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let t = page.trim();
+    if t.lines().count() != 1 {
+        return false;
+    }
+    let flat: String = t
+        .nfd()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .collect::<String>()
+        .to_lowercase();
+    flat.contains("(sin teoria") || flat.contains("(sin contenido teorico") || flat.starts_with("ver p.")
+}
+
 fn chunk_page(file: &str, page: usize, text: &str, out: &mut Vec<Chunk>) {
     let text = normalize(text);
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -270,6 +291,15 @@ mod tests {
         let c = chunks_of(&words(201));
         assert_eq!(c.len(), 2);
         assert!(c[1].text.starts_with("w160 "));
+    }
+
+    #[test]
+    fn placeholder_pages_are_detected() {
+        assert!(is_placeholder("\nEjercicios de práctica (sin teoría nueva).\n"));
+        assert!(is_placeholder("Cierre de la clase (sin contenido teórico nuevo)."));
+        assert!(is_placeholder("Ver p.6."));
+        assert!(!is_placeholder("Matriz: disposición rectangular de números."));
+        assert!(!is_placeholder("Definición.\nEjemplo (sin teoría)."));
     }
 
     #[test]

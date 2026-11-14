@@ -29,8 +29,13 @@ Page N of the cache is page N of the PDF.
 2. Keep **exactly the same number of pages**: same number of `\f` separators. Page numbers in the
    hint sources come from them. Never merge or drop pages.
 3. Never leave a page empty (the app flags the file as having "pages with no text"). A page with
-   nothing worth keeping gets one short line, e.g. `Portada: Clase 04, Elementos de lógica proposicional.`
-   or `Ejercicios de práctica (sin contenido teórico).`
+   nothing worth keeping gets exactly **one line** in this stub format (the app recognizes it and
+   leaves the page out of the search, so it never competes with real content):
+   - `<short description> (sin teoría).`, e.g. `Ejercicios de práctica (sin teoría).`,
+     `Portada de la clase 04 (sin contenido teórico).`, `Soluciones de ejercicios (sin teoría nueva).`
+     The line must contain `(sin teoría` or `(sin contenido teórico` (any ending after that is fine),
+     and nothing else on the page. Never put this marker on a page that has real content.
+   - `Ver p.N.` for a page whose content moved to page N.
 4. Stay in the language of the source (Spanish). Do not translate. Keep the course's own
    terminology and spelling exactly (accents, ñ, ¿ ¡), because search matches these words.
 5. UTF-8 only. Use real Unicode symbols, never LaTeX (`∧`, not `\wedge`).
