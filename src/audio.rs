@@ -21,23 +21,25 @@ pub enum Source {
     Mic,
 }
 
-fn pactl(arg: &str) -> Result<String> {
-    let out = Command::new("pactl").arg(arg).output().context("could not run pactl")?;
-    anyhow::ensure!(out.status.success(), "pactl {arg} failed");
+const SPEC: Spec = Spec { format: Format::S16le, channels: 1, rate: RATE };
+
+/// Runs `pactl <args>` and returns its trimmed stdout.
+pub fn pactl(args: &[&str]) -> Result<String> {
+    let out = Command::new("pactl").args(args).output().context("could not run pactl")?;
+    anyhow::ensure!(out.status.success(), "pactl {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Resolved on every (re)connect so a switch of headphones is picked up.
 fn source_name(source: Source) -> Result<String> {
     match source {
-        Source::Speakers => Ok(format!("{}.monitor", pactl("get-default-sink")?)),
-        Source::Mic => pactl("get-default-source"),
+        Source::Speakers => Ok(format!("{}.monitor", pactl(&["get-default-sink"])?)),
+        Source::Mic => pactl(&["get-default-source"]),
     }
 }
 
 /// Blocking capture. `on_chunk` returns false to stop.
 pub fn capture(source: Source, stop: &AtomicBool, mut on_chunk: impl FnMut(Vec<u8>) -> bool) -> Result<()> {
-    let spec = Spec { format: Format::S16le, channels: 1, rate: RATE };
     let dev = source_name(source)?;
     let stream_name = match source {
         Source::Speakers => "zoom-monitor",
@@ -50,7 +52,7 @@ pub fn capture(source: Source, stop: &AtomicBool, mut on_chunk: impl FnMut(Vec<u
         minreq: u32::MAX,
         fragsize: CHUNK as u32,
     };
-    let s = Simple::new(None, "assistant", Direction::Record, Some(&dev), stream_name, &spec, None, Some(&attr))
+    let s = Simple::new(None, "assistant", Direction::Record, Some(&dev), stream_name, &SPEC, None, Some(&attr))
         .map_err(|e| anyhow::anyhow!("pulse: {e}"))?;
     let mut buf = vec![0u8; CHUNK];
     while !stop.load(Ordering::Relaxed) {
@@ -59,6 +61,15 @@ pub fn capture(source: Source, stop: &AtomicBool, mut on_chunk: impl FnMut(Vec<u
             break;
         }
     }
+    Ok(())
+}
+
+/// Plays 24 kHz s16le mono PCM to the named sink and waits until it has been played (blocking).
+pub fn play(device: &str, pcm: &[u8]) -> Result<()> {
+    let s = Simple::new(None, "assistant", Direction::Playback, Some(device), "interviewer", &SPEC, None, None)
+        .map_err(|e| anyhow::anyhow!("pulse: {e}"))?;
+    s.write(pcm).map_err(|e| anyhow::anyhow!("pulse write: {e}"))?;
+    s.drain().map_err(|e| anyhow::anyhow!("pulse drain: {e}"))?;
     Ok(())
 }
 

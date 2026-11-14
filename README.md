@@ -131,6 +131,35 @@ cargo test
 ```
 runs the unit tests and an integration test that drops a local WebSocket connection and checks that the client reconnects.
 
+## Interview rehearsal (a second machine)
+
+To test the whole setup end to end, run the same binary on another machine as a simulated interviewer and talk to it over a real Zoom or Google Meet call. The network between the machines does not matter: the call goes through Zoom/Meet.
+
+```
+machine B (interviewer)                               machine A (you)
+LLM text ─► TTS ─► sink "interviewer_out"                      ┌► assistant: subtitles + hints
+                   └► "Interviewer_mic" ─► Zoom/Meet ─────────┘
+your voice ◄─ Zoom/Meet output ◄─ default sink .monitor ─► realtime transcription ─► LLM
+```
+
+On machine B (Linux with PipeWire/PulseAudio, a graphical session, the same `config.toml`, `docs/<topic>`, `OPENAI_API_KEY` and `HF_TOKEN`):
+
+```bash
+./assistant --interview --topic demo --persona persona.md --questions 5
+```
+
+1. The program creates a virtual microphone **Interviewer_mic** (a PulseAudio null sink plus a remapped source) and waits.
+2. In Zoom or Meet on machine B, choose **Interviewer_mic** as the microphone and keep the speakers on the default output. Join the call, then press Enter.
+3. The interviewer greets you and asks question 1. When you stop talking for about 3 s it reacts to your answer in a sentence and asks the next one. After the last answer it says goodbye. The dialogue is also printed in the terminal.
+
+`persona.md` is free text, for example: *Eres Pedro, tech lead en Acme. Entrevistas a un backend developer para el proyecto X. Eres directo pero amable.* Without `--persona`, the `persona` from `[interview]` in `config.toml` is used. The questions are based on the PDFs in the chosen `docs/` folder.
+
+Notes:
+- Turn off "automatic microphone volume" and noise suppression in Zoom/Meet if the synthetic voice is cut.
+- The interviewer waits up to 60 s for an answer, asks "¿Me escuchas?" once, and moves on if there is still silence.
+- Remove the virtual devices afterwards: `pactl unload-module module-remap-source && pactl unload-module module-null-sink`.
+- Cost of a 10-minute run is roughly 10-20 cents in total: speech synthesis, transcription of your answers, and a few LLM requests. Check current prices.
+
 ## Troubleshooting
 
 - **No subtitles, `test.wav` is silent.** The app records the monitor of the *default* output device. Make sure Zoom plays through the default output (check with `pactl get-default-sink`) or change the default in your sound settings.

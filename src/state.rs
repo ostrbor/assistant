@@ -43,44 +43,39 @@ impl Hint {
     /// Parses streamed text in the format `Q: … / ES: … / EN: …`.
     pub fn apply_raw(&mut self, raw: &str) {
         self.raw = raw.to_string();
-        let (mut q, mut es, mut en) = (String::new(), String::new(), String::new());
-        let mut cur = 0;
-        for line in raw.lines() {
-            let line = line.trim();
-            let (field, rest) = if let Some(r) = line.strip_prefix("Q:") {
-                (1, r)
-            } else if let Some(r) = line.strip_prefix("ES:") {
-                (2, r)
-            } else if let Some(r) = line.strip_prefix("EN:") {
-                (3, r)
-            } else {
-                (cur, line)
-            };
-            cur = field;
-            let target = match field {
-                1 => &mut q,
-                2 => &mut es,
-                3 => &mut en,
-                _ => continue,
-            };
-            if !target.is_empty() {
-                target.push(' ');
+        const PREFIXES: [&str; 3] = ["Q:", "ES:", "EN:"];
+        let mut fields: [String; 3] = Default::default();
+        let mut cur = None;
+        for line in raw.lines().map(str::trim) {
+            let mut rest = line;
+            if let Some((i, r)) = PREFIXES.iter().enumerate().find_map(|(i, p)| Some((i, line.strip_prefix(p)?))) {
+                cur = Some(i);
+                rest = r;
             }
-            target.push_str(rest.trim());
+            // Text before the first prefix is ignored (it stays in `raw`).
+            let Some(i) = cur else { continue };
+            if !fields[i].is_empty() {
+                fields[i].push(' ');
+            }
+            fields[i].push_str(rest.trim());
         }
-        self.question = q;
-        self.es = es;
-        self.en = en;
+        let [question, es, en] = fields;
+        (self.question, self.es, self.en) = (question, es, en);
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AppState {
     pub segments: Vec<Segment>,
     pub listening: bool,
     pub listening_since: Option<Instant>,
     pub status: String,
+    /// General error (dismissible).
     pub error: Option<String>,
+    /// Connection problem; cleared on reconnect and on Stop, never touches `error`.
+    pub conn_error: Option<String>,
+    /// Extra info about the selected folder, e.g. "42 chunks".
+    pub topic_info: Option<String>,
     /// Hint currently shown to the user.
     pub hint: Option<Hint>,
     /// Hint prepared in the background (shown on button press).
@@ -118,6 +113,13 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::Hint;
+
+    #[test]
+    fn unprefixed_text_is_kept_in_raw() {
+        let mut h = Hint::default();
+        h.apply_raw("Tengo cinco años.");
+        assert!(h.es.is_empty() && h.raw == "Tengo cinco años.");
+    }
 
     #[test]
     fn parses_streaming_hint() {

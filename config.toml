@@ -25,3 +25,16 @@ api_key_env = "HF_TOKEN"
 translate_model = "openai/gpt-oss-20b:groq"
 # Hints go to all listed models in parallel; the first to answer wins (hedging)
 hint_models = ["openai/gpt-oss-120b:cerebras", "openai/gpt-oss-120b:groq"]
+
+[interview]
+# Interviewer simulator (`--interview`), run on the machine that joins the call as the other person.
+# Who the interviewer is (can be replaced with `--persona <file>`)
+persona = "Eres Laura, engineering manager en una empresa de software. Entrevistas a un candidato para un puesto de desarrollador. Tono amable y profesional."
+# Questions after the greeting
+questions = 5
+# Text-to-speech (OpenAI, same key as transcription)
+tts_model = "gpt-4o-mini-tts"
+voice = "coral"
+tts_instructions = "Habla en español, con tono amable y profesional y un ritmo natural."
+# Quiet time after which an answer counts as finished
+answer_silence_secs = 3.0

@@ -1,5 +1,5 @@
 use crate::core::Core;
-use crate::state::{Hint, Speaker};
+use crate::state::{Hint, Shared, Speaker};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,8 +24,14 @@ pub fn is_question(es: &str) -> bool {
 /// Hint button: show the one prepared in the background or generate it now.
 pub fn ask(core: &Arc<Core>) {
     let max_age = Duration::from_secs(core.cfg.hint_max_age_secs);
-    let used = core.shared.read(|s| s.pending.as_ref().is_some_and(|h| h.started.is_some_and(|t| t.elapsed() < max_age)));
-    if used {
+    let (fresh, on_screen) = core.shared.read(|s| {
+        (
+            s.pending.as_ref().is_some_and(|h| h.started.is_some_and(|t| t.elapsed() < max_age)),
+            // The finished hint is already on screen: pressing the button again asks for a new one.
+            s.pending_shown && s.hint.as_ref().is_some_and(|h| h.done),
+        )
+    });
+    if fresh && !on_screen {
         core.shared.update(|s| {
             s.pending_shown = true;
             s.hint = s.pending.clone();
@@ -92,30 +98,23 @@ async fn run(core: &Arc<Core>, show: bool) -> anyhow::Result<()> {
     let user = format!("Transcript (latest last):\n{}\n\nDocument excerpts:\n{}", transcript.join("\n"), excerpts);
     let messages = json!([{ "role": "system", "content": SYSTEM }, { "role": "user", "content": user }]);
 
-    let started = Instant::now();
-    let mut hint = Hint { sources, started: Some(started), ..Default::default() };
-    publish(core, &hint, show);
+    let mut hint = Hint { sources, started: Some(Instant::now()), ..Default::default() };
+    publish(&core.shared, &hint, show);
 
-    let shared = core.shared.clone();
-    let mut cur = hint.clone();
     let text = core
         .llm
         .hedged_stream(&core.cfg.llm.hint_models, messages, |raw| {
-            cur.apply_raw(raw);
-            publish_with(&shared, &cur, show);
+            hint.apply_raw(raw);
+            publish(&core.shared, &hint, show);
         })
         .await?;
     hint.apply_raw(&text);
     hint.done = true;
-    publish(core, &hint, show);
+    publish(&core.shared, &hint, show);
     Ok(())
 }
 
-fn publish(core: &Arc<Core>, h: &Hint, show: bool) {
-    publish_with(&core.shared, h, show);
-}
-
-fn publish_with(shared: &crate::state::Shared, h: &Hint, show: bool) {
+fn publish(shared: &Shared, h: &Hint, show: bool) {
     shared.update(|s| {
         s.pending = Some(h.clone());
         if show {

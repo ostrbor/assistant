@@ -8,6 +8,37 @@ pub struct Config {
     pub hint_max_age_secs: u64,
     pub transcribe: Transcribe,
     pub llm: Llm,
+    #[serde(default)]
+    pub interview: Interview,
+}
+
+/// Settings of the interviewer simulator (`--interview`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Interview {
+    /// Who the interviewer is; can be overridden with `--persona <file>`.
+    pub persona: String,
+    /// Number of questions after the greeting.
+    pub questions: usize,
+    pub tts_model: String,
+    pub voice: String,
+    /// Tone of the synthesized voice (gpt-4o-mini-tts only).
+    pub tts_instructions: String,
+    /// Quiet time after which an answer counts as finished.
+    pub answer_silence_secs: f64,
+}
+
+impl Default for Interview {
+    fn default() -> Self {
+        Self {
+            persona: "Eres Laura, engineering manager en una empresa de software. Entrevistas a un candidato para un puesto de desarrollador. Tono amable y profesional.".into(),
+            questions: 5,
+            tts_model: "gpt-4o-mini-tts".into(),
+            voice: "coral".into(),
+            tts_instructions: "Habla en español, con tono amable y profesional y un ritmo natural.".into(),
+            answer_silence_secs: 3.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

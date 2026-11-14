@@ -3,6 +3,7 @@ mod config;
 mod core;
 mod docs;
 mod hint;
+mod interview;
 mod llm;
 mod realtime;
 mod search;
@@ -12,7 +13,7 @@ mod ui;
 mod update;
 
 use anyhow::{Result, anyhow};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     #[cfg(feature = "updater")]
@@ -25,9 +26,10 @@ fn main() -> Result<()> {
     }
     let cfg = Arc::new(config::Config::load("config.toml")?);
     let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(String::as_str);
+    let has = |name: &str| args.iter().any(|a| a == name);
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
 
-    if mode == Some("--test-audio") {
+    if has("--test-audio") {
         eprintln!("Recording 5 seconds of speaker output to test.wav…");
         audio::record_wav("test.wav", 5)?;
         eprintln!("Done: test.wav");
@@ -35,12 +37,11 @@ fn main() -> Result<()> {
     }
 
     // `--topic <name>` selects a document folder at startup.
-    let topic_arg = args.iter().position(|a| a == "--topic").and_then(|i| args.get(i + 1)).cloned();
+    let topic_arg = flag("--topic").cloned();
 
-    if mode == Some("--test-search") || args.iter().any(|a| a == "--test-search") {
+    if has("--test-search") {
         let topic = topic_arg.ok_or_else(|| anyhow!("usage: --test-search --topic <name> \"question\""))?;
-        let dir = std::path::Path::new(&cfg.docs_dir).join(&topic);
-        let index = search::Index::build(docs::load_chunks(&dir.to_string_lossy())?);
+        let index = search::Index::build(docs::load_chunks(&docs::topic_dir(&cfg.docs_dir, &topic)?)?);
         eprintln!("Indexed chunks: {}", index.len());
         let q = args.last().map(String::as_str).unwrap_or("");
         for (score, c) in index.search(&[(q, 1.0)], 5) {
@@ -49,15 +50,30 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--interview --topic <name> [--persona <file>] [--questions N]`: the interviewer simulator (no window).
+    if has("--interview") {
+        let topic = topic_arg.ok_or_else(|| anyhow!("usage: --interview --topic <name> [--persona <file>] [--questions N]"))?;
+        let persona = flag("--persona")
+            .map(|p| std::fs::read_to_string(p).map_err(|e| anyhow!("cannot read {p}: {e}")))
+            .transpose()?
+            .map(|t| t.trim().to_string());
+        let questions = flag("--questions").map(|q| q.parse::<usize>().map_err(|_| anyhow!("--questions needs a number"))).transpose()?;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        return rt.block_on(interview::run(&cfg, &topic, persona, questions));
+    }
+
     let (topics, topics_err) = match docs::list_topics(&cfg.docs_dir) {
         Ok(t) => (t, None),
         Err(e) => (vec![], Some(e.to_string())),
     };
 
+    let hint_max_age = std::time::Duration::from_secs(cfg.hint_max_age_secs);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = rt.handle().clone();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([720.0, 820.0]).with_always_on_top().with_title("Zoom Assistant"),
+        // Remember window size and position between runs.
+        persist_window: true,
         ..Default::default()
     };
     eframe::run_native(
@@ -72,14 +88,13 @@ fn main() -> Result<()> {
                 s.error = topics_err;
                 s.topics = topics;
             });
-            let llm = llm::Llm::new(&cfg.llm);
-            let core = Arc::new(core::Core { cfg, shared: shared.clone(), index: RwLock::new(None), llm, prep: Mutex::new(None) });
+            let core = Arc::new(core::Core::new(cfg, shared.clone()));
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             if let Some(t) = auto {
                 let _ = cmd_tx.send(core::Cmd::SelectTopic(t));
             }
             handle.spawn(core::run(core, cmd_rx));
-            Ok(Box::new(ui::App::new(shared, cmd_tx)))
+            Ok(Box::new(ui::App::new(shared, cmd_tx, hint_max_age)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))?;

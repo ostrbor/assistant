@@ -16,7 +16,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Llm {
     http: reqwest::Client,
-    base_url: String,
+    /// Full chat-completions endpoint.
+    url: String,
     key: Option<String>,
 }
 
@@ -30,9 +31,13 @@ impl Llm {
     pub fn new(cfg: &config::Llm) -> Self {
         Self {
             http: reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build().expect("HTTP client"),
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            url: format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
             key: config::env_key(&cfg.api_key_env).ok(),
         }
+    }
+
+    fn key(&self) -> Result<&str> {
+        self.key.as_deref().ok_or_else(|| anyhow!("LLM token is not set (see api_key_env in config.toml)"))
     }
 
     fn body(model: &str, messages: &Value, stream: bool, max_tokens: u32) -> Value {
@@ -44,7 +49,7 @@ impl Llm {
     }
 
     pub async fn translate(&self, model: &str, context: &[String], es: &str) -> Result<String> {
-        let key = self.key.as_deref().ok_or_else(|| anyhow!("LLM token is not set (see api_key_env in config.toml)"))?;
+        let key = self.key()?;
         let mut user = String::new();
         if !context.is_empty() {
             user.push_str("Previous utterances (context only):\n");
@@ -59,7 +64,7 @@ impl Llm {
         ]);
         let res = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&self.url)
             .bearer_auth(key)
             .timeout(TRANSLATE_TIMEOUT)
             .json(&Self::body(model, &messages, false, 600))
@@ -75,13 +80,13 @@ impl Llm {
 
     /// Streams from several models/providers at once and keeps whichever starts answering first.
     pub async fn hedged_stream(&self, models: &[String], messages: Value, mut on_update: impl FnMut(&str)) -> Result<String> {
-        let key = self.key.clone().ok_or_else(|| anyhow!("LLM token is not set (see api_key_env in config.toml)"))?;
+        let key = self.key()?;
         let (tx, mut rx) = mpsc::unbounded_channel::<(usize, StreamEv)>();
         let handles: Vec<_> = models
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let (http, url, key, tx) = (self.http.clone(), format!("{}/chat/completions", self.base_url), key.clone(), tx.clone());
+                let (http, url, key, tx) = (self.http.clone(), self.url.clone(), key.to_string(), tx.clone());
                 let body = Self::body(m, &messages, true, 800);
                 tokio::spawn(async move {
                     if let Err(e) = stream_one(&http, &url, &key, body, i, &tx).await {
@@ -152,12 +157,11 @@ async fn stream_one(http: &reqwest::Client, url: &str, key: &str, body: Value, i
                 let _ = tx.send((idx, StreamEv::Done));
                 return Ok(());
             }
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(d) = v["choices"][0]["delta"]["content"].as_str() {
-                    if !d.is_empty() {
-                        let _ = tx.send((idx, StreamEv::Delta(d.to_string())));
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(data)
+                && let Some(d) = v["choices"][0]["delta"]["content"].as_str()
+                && !d.is_empty()
+            {
+                let _ = tx.send((idx, StreamEv::Delta(d.to_string())));
             }
         }
     }

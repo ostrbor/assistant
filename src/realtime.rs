@@ -50,11 +50,12 @@ pub async fn run_with_reconnect(
     ev_tx: UnboundedSender<Ev>,
     speaker: Speaker,
 ) -> Result<()> {
+    let conn = Conn { cfg, url, key, shared: &shared, ev_tx: &ev_tx, speaker };
     let mut backlog: VecDeque<Vec<u8>> = VecDeque::new();
     let mut attempt = 0u32;
     loop {
         let mut up_since = None;
-        let res = run(cfg, url, key, &mut audio_rx, &mut backlog, &shared, &ev_tx, speaker, &mut up_since).await;
+        let res = run(&conn, &mut audio_rx, &mut backlog, &mut up_since).await;
         // Whatever was half-transcribed is final now: translate it and detect questions.
         finalize_partials(&shared, &ev_tx, speaker);
         let e = match res {
@@ -71,7 +72,7 @@ pub async fn run_with_reconnect(
         let wait = backoff(attempt);
         shared.update(|s| {
             s.status = format!("Reconnecting in {}s (attempt {attempt})…", wait.as_secs());
-            s.error = Some(format!("Connection lost: {e}"));
+            s.conn_error = Some(format!("Connection lost: {e}"));
         });
         sleep(wait).await;
         trim_backlog(&mut audio_rx, &mut backlog);
@@ -107,27 +108,32 @@ fn finalize_partials(shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spea
     }
 }
 
-async fn send<S>(w: &mut S, text: String) -> Result<()>
+async fn send<S>(w: &mut S, msg: Message) -> Result<()>
 where
     S: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
-    timeout(SEND_TIMEOUT, w.send(Message::Text(text))).await.map_err(|_| anyhow!("send timed out"))??;
+    timeout(SEND_TIMEOUT, w.send(msg)).await.map_err(|_| anyhow!("send timed out"))??;
     Ok(())
 }
 
+/// Everything one connection needs; the same for every reconnect attempt.
+struct Conn<'a> {
+    cfg: &'a Transcribe,
+    url: &'a str,
+    key: &'a str,
+    shared: &'a Shared,
+    ev_tx: &'a UnboundedSender<Ev>,
+    speaker: Speaker,
+}
+
 /// One connection. `up_since` is set once the session is established.
-#[allow(clippy::too_many_arguments)]
 async fn run(
-    cfg: &Transcribe,
-    url: &str,
-    key: &str,
+    conn: &Conn<'_>,
     audio_rx: &mut UnboundedReceiver<Vec<u8>>,
     backlog: &mut VecDeque<Vec<u8>>,
-    shared: &Shared,
-    ev_tx: &UnboundedSender<Ev>,
-    speaker: Speaker,
     up_since: &mut Option<Instant>,
 ) -> Result<()> {
+    let Conn { cfg, url, key, shared, ev_tx, speaker } = *conn;
     let mut req = url.into_client_request()?;
     req.headers_mut().insert("Authorization", format!("Bearer {key}").parse()?);
     req.headers_mut().insert("OpenAI-Beta", "realtime=v1".parse()?);
@@ -142,15 +148,15 @@ async fn run(
             "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500 }
         }
     });
-    send(&mut w, session.to_string()).await?;
+    send(&mut w, Message::Text(session.to_string())).await?;
     *up_since = Some(Instant::now());
     shared.update(|s| {
         s.status = "Listening".into();
-        s.error = None;
+        s.conn_error = None;
     });
 
     let b64 = base64::engine::general_purpose::STANDARD;
-    let audio_msg = |c: &[u8]| json!({ "type": "input_audio_buffer.append", "audio": b64.encode(c) }).to_string();
+    let audio_msg = |c: &[u8]| Message::Text(json!({ "type": "input_audio_buffer.append", "audio": b64.encode(c) }).to_string());
 
     // Audio captured while we were disconnected goes first.
     while let Some(c) = backlog.pop_front() {
@@ -169,7 +175,7 @@ async fn run(
                 if last_rx.elapsed() > DEAD_AFTER {
                     bail!("connection timed out");
                 }
-                send_ping(&mut w).await?;
+                send(&mut w, Message::Ping(Vec::new())).await?;
             }
             msg = r.next() => {
                 last_rx = Instant::now();
@@ -182,14 +188,6 @@ async fn run(
             }
         }
     }
-}
-
-async fn send_ping<S>(w: &mut S) -> Result<()>
-where
-    S: Sink<Message, Error = tungstenite::Error> + Unpin,
-{
-    timeout(SEND_TIMEOUT, w.send(Message::Ping(Vec::new()))).await.map_err(|_| anyhow!("ping timed out"))??;
-    Ok(())
 }
 
 fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) -> Result<()> {
@@ -208,15 +206,14 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
         }
         "conversation.item.input_audio_transcription.completed" => {
             let full = v["transcript"].as_str().unwrap_or_default().trim().to_string();
-            let id = item_id.clone();
             shared.update(|s| {
                 if full.is_empty() {
-                    s.segments.retain(|x| x.item_id != id);
-                } else if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == id) {
+                    s.segments.retain(|x| x.item_id != item_id);
+                } else if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == item_id) {
                     seg.es = full.clone();
                     seg.partial = false;
                 } else {
-                    s.segments.push(Segment { item_id: id, speaker, es: full.clone(), en: None, partial: false, at: Instant::now() });
+                    s.segments.push(Segment { item_id: item_id.clone(), speaker, es: full.clone(), en: None, partial: false, at: Instant::now() });
                 }
             });
             if !full.is_empty() {
@@ -227,7 +224,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
         // which goes through the reconnect path.
         "error" => {
             let msg = v["error"]["message"].as_str().unwrap_or("unknown error").to_string();
-            shared.update(|s| s.error = Some(format!("OpenAI: {msg}")));
+            shared.update(|s| s.conn_error = Some(format!("OpenAI: {msg}")));
         }
         _ => {}
     }

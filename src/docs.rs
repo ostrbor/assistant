@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use std::path::Path;
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -31,10 +31,18 @@ fn has_pdf(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Path of a topic folder. The name comes from our own folder list, but never allow path traversal.
+pub fn topic_dir(docs_dir: &str, topic: &str) -> Result<PathBuf> {
+    if topic.is_empty() || topic.contains(['/', '\\']) || topic.starts_with('.') {
+        bail!("Invalid folder name: {topic}");
+    }
+    Ok(Path::new(docs_dir).join(topic))
+}
+
 /// Reads all PDFs in a folder (pdftotext, .txt cache next to each file) and splits them into chunks.
-pub fn load_chunks(dir: &str) -> Result<Vec<Chunk>> {
+pub fn load_chunks(dir: &Path) -> Result<Vec<Chunk>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("document folder not found: {dir}"))?
+        .with_context(|| format!("document folder not found: {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")))
         .collect();

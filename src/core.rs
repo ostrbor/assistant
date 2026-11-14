@@ -35,6 +35,20 @@ pub struct Core {
     pub prep: Mutex<Option<AbortHandle>>,
 }
 
+impl Core {
+    pub fn new(cfg: Arc<Config>, shared: Shared) -> Self {
+        let llm = Llm::new(&cfg.llm);
+        Self { cfg, shared, index: RwLock::new(None), llm, prep: Mutex::new(None) }
+    }
+
+    /// Stops a hint that is still being prepared or streamed.
+    pub fn cancel_hint(&self) {
+        if let Some(h) = self.prep.lock().unwrap().take() {
+            h.abort();
+        }
+    }
+}
+
 struct Session {
     stop: Arc<AtomicBool>,
     /// One transcription task per audio source (speakers, and the microphone if enabled).
@@ -58,12 +72,17 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
                 Some(Cmd::AskHint) => hint::ask(&core),
                 Some(Cmd::SelectTopic(t)) => select_topic(&core, t),
                 Some(Cmd::RefreshTopics) => refresh_topics(&core),
-                Some(Cmd::Clear) => core.shared.update(|s| {
-                    s.segments.clear();
-                    s.hint = None;
-                    s.pending = None;
-                    s.error = None;
-                }),
+                Some(Cmd::Clear) => {
+                    // Stop a hint that is still streaming, or it would reappear.
+                    core.cancel_hint();
+                    core.shared.update(|s| {
+                        s.segments.clear();
+                        s.hint = None;
+                        s.pending = None;
+                        s.pending_shown = false;
+                        s.error = None;
+                    });
+                }
             },
             ev = ev_rx.recv() => match ev {
                 Some(Ev::Completed(id)) => on_completed(&core, &id),
@@ -86,6 +105,7 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
         s.listening_since = Some(Instant::now());
         s.status = "Connecting…".into();
         s.error = None;
+        s.conn_error = None;
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -97,25 +117,15 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
     Ok(Session { stop, tasks })
 }
 
-/// Capture thread + transcription task for one audio source. Silence is dropped before it is sent.
-fn spawn_stream(
-    core: &Arc<Core>,
-    key: &str,
-    speaker: Speaker,
-    source: audio::Source,
-    threshold: f64,
-    stop: &Arc<AtomicBool>,
-    ev_tx: &UnboundedSender<Ev>,
-) -> JoinHandle<()> {
-    let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+/// Audio capture runs on its own thread (blocking pulse API). If the device goes away
+/// (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
+/// Silence is dropped before the frames are sent to `audio_tx`.
+pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: f64, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>) {
     let lost = match source {
         audio::Source::Speakers => "Audio device lost",
         audio::Source::Mic => "Microphone lost",
     };
-
-    // Audio capture runs on its own thread (blocking pulse API). If the device goes away
-    // (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
-    let (stop2, shared2) = (stop.clone(), core.shared.clone());
+    let (stop2, shared2) = (stop.clone(), shared.clone());
     std::thread::spawn(move || {
         let mut gate = audio::SilenceGate::new(threshold);
         let mut recovering = false;
@@ -145,6 +155,20 @@ fn spawn_stream(
             }
         }
     });
+}
+
+/// Capture thread + transcription task for one audio source. Silence is dropped before it is sent.
+fn spawn_stream(
+    core: &Arc<Core>,
+    key: &str,
+    speaker: Speaker,
+    source: audio::Source,
+    threshold: f64,
+    stop: &Arc<AtomicBool>,
+    ev_tx: &UnboundedSender<Ev>,
+) -> JoinHandle<()> {
+    let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+    spawn_capture(&core.shared, source, threshold, stop, audio_tx);
 
     let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());
     tokio::spawn(async move {
@@ -168,6 +192,7 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
         s.listening = false;
         s.listening_since = None;
         s.status = "Stopped".into();
+        s.conn_error = None;
         for seg in &mut s.segments {
             seg.partial = false;
         }
@@ -190,8 +215,8 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
             shown = s.pending_shown;
             s.pending = None;
         });
-        if !shown && let Some(h) = core.prep.lock().unwrap().take() {
-            h.abort();
+        if !shown {
+            core.cancel_hint();
         }
         return;
     }
@@ -222,6 +247,7 @@ pub fn refresh_topics(core: &Arc<Core>) {
         Ok(topics) => core.shared.update(|s| {
             if s.topic.as_ref().is_some_and(|t| !topics.contains(t)) {
                 s.topic = None;
+                s.topic_info = None;
             }
             s.topics = topics;
         }),
@@ -231,46 +257,35 @@ pub fn refresh_topics(core: &Arc<Core>) {
 
 /// Loads and indexes a document folder off the async threads, then swaps the index in.
 fn select_topic(core: &Arc<Core>, topic: String) {
-    // The name comes from our own folder list, but never allow path traversal.
-    if topic.is_empty() || topic.contains(['/', '\\']) || topic.starts_with('.') {
-        core.shared.update(|s| s.error = Some(format!("Invalid folder name: {topic}")));
-        return;
-    }
+    let dir = match crate::docs::topic_dir(&core.cfg.docs_dir, &topic) {
+        Ok(d) => d,
+        Err(e) => return core.shared.update(|s| s.error = Some(e.to_string())),
+    };
     core.shared.update(|s| {
         s.topic_loading = true;
-        s.status = format!("Loading {topic}…");
+        s.topic_info = None;
         s.error = None;
     });
     let core2 = core.clone();
     tokio::spawn(async move {
-        let dir = std::path::Path::new(&core2.cfg.docs_dir).join(&topic).to_string_lossy().to_string();
-        let built = tokio::task::spawn_blocking(move || {
-            crate::docs::load_chunks(&dir).map(crate::search::Index::build)
-        })
-        .await;
-        match built {
-            Ok(Ok(index)) => {
+        let built = tokio::task::spawn_blocking(move || crate::docs::load_chunks(&dir).map(Index::build)).await;
+        match built.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(index) => {
                 let n = index.len();
                 *core2.index.write().unwrap() = Some(Arc::new(index));
                 // A hint prepared from the previous folder is no longer valid.
-                if let Some(h) = core2.prep.lock().unwrap().take() {
-                    h.abort();
-                }
+                core2.cancel_hint();
                 core2.shared.update(|s| {
                     s.topic = Some(topic.clone());
                     s.topic_loading = false;
                     s.pending = None;
                     s.hint = None;
-                    s.status = format!("{topic}: {n} chunks");
+                    s.topic_info = Some(format!("{n} chunks"));
                     if n == 0 {
                         s.error = Some(format!("No text found in {topic} (scanned PDFs are not supported)"));
                     }
                 });
             }
-            Ok(Err(e)) => core2.shared.update(|s| {
-                s.topic_loading = false;
-                s.error = Some(format!("Could not load {topic}: {e}"));
-            }),
             Err(e) => core2.shared.update(|s| {
                 s.topic_loading = false;
                 s.error = Some(format!("Could not load {topic}: {e}"));

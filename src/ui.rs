@@ -1,16 +1,25 @@
 use crate::core::Cmd;
-use crate::state::{Shared, Speaker};
-use eframe::egui::{self, Color32, Key, Modifiers, RichText};
+use crate::state::{AppState, Shared, Speaker};
+use eframe::egui::{self, Align, Color32, Key, Modifiers, RichText};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// How long the Clear button waits for the confirming second click.
+const CLEAR_CONFIRM: Duration = Duration::from_secs(3);
 
 pub struct App {
     shared: Shared,
     cmd_tx: UnboundedSender<Cmd>,
+    hint_max_age: Duration,
+    /// Set by the first click on Clear.
+    clear_armed: Option<Instant>,
+    /// Jump to the newest line on the next frame.
+    to_bottom: bool,
 }
 
 impl App {
-    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>) -> Self {
-        Self { shared, cmd_tx }
+    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration) -> Self {
+        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false }
     }
 
     fn send(&self, c: Cmd) {
@@ -18,27 +27,80 @@ impl App {
     }
 }
 
+fn age_text(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 5 {
+        "just now".into()
+    } else if s < 60 {
+        format!("{s} s ago")
+    } else {
+        format!("{} min ago", s / 60)
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Hotkeys (consumed before widgets so Space does not click a focused button).
-        let space = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space));
-        let h = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::H));
+        // Hotkeys (consumed before widgets so Space does not click a focused button),
+        // but not while a popup (the folder list) is open or a text field has focus.
+        let typing = ctx.memory(|m| m.any_popup_open()) || ctx.wants_keyboard_input();
+        let (space, h) = if typing {
+            (false, false)
+        } else {
+            (ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space)), ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::H)))
+        };
 
-        let (segments, listening, since, status, error, hint, topics, topic, loading) = self.shared.read(|s| {
-            (s.segments.clone(), s.listening, s.listening_since, s.status.clone(), s.error.clone(), s.hint.clone(), s.topics.clone(), s.topic.clone(), s.topic_loading)
-        });
+        let AppState {
+            segments,
+            listening,
+            listening_since: since,
+            status,
+            error,
+            conn_error,
+            hint,
+            pending,
+            pending_shown,
+            topics,
+            topic,
+            topic_info,
+            topic_loading: loading,
+        } = self.shared.read(AppState::clone);
 
+        // A hint prepared in the background and not shown yet: tell the user it is ready.
+        let ready = !pending_shown && pending.as_ref().is_some_and(|p| p.started.is_some_and(|t| t.elapsed() < self.hint_max_age));
+        let preparing = ready && pending.as_ref().is_some_and(|p| !p.done);
+
+        let mut dismiss_error = false;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let label = if listening { "■ Stop (Space)" } else { "● Listen (Space)" };
                 if ui.button(RichText::new(label).size(18.0)).clicked() || space {
                     self.send(if listening { Cmd::Stop } else { Cmd::Start });
                 }
-                if ui.button(RichText::new("Hint (H)").size(18.0)).clicked() || h {
+                let hint_label = if ready { "Hint ● (H)" } else { "Hint (H)" };
+                let mut hint_text = RichText::new(hint_label).size(18.0);
+                if ready {
+                    hint_text = hint_text.color(Color32::LIGHT_GREEN);
+                }
+                if ui.button(hint_text).on_hover_text("Show the hint; press again for a new one").clicked() || h {
                     self.send(Cmd::AskHint);
                 }
-                if ui.button("Clear").clicked() {
-                    self.send(Cmd::Clear);
+                if preparing {
+                    ui.spinner();
+                }
+                let armed = self.clear_armed.is_some_and(|t| t.elapsed() < CLEAR_CONFIRM);
+                if !armed {
+                    self.clear_armed = None;
+                }
+                let clear_label = if armed { RichText::new("Clear? (click again)").color(Color32::LIGHT_RED) } else { RichText::new("Clear") };
+                if ui.button(clear_label).clicked() {
+                    if armed {
+                        self.clear_armed = None;
+                        self.to_bottom = true;
+                        self.send(Cmd::Clear);
+                    } else {
+                        self.clear_armed = Some(Instant::now());
+                        ctx.request_repaint_after(CLEAR_CONFIRM);
+                    }
                 }
                 ui.separator();
                 ui.label("Docs:");
@@ -52,6 +114,11 @@ impl eframe::App for App {
                         }
                     });
                 });
+                if loading {
+                    ui.spinner();
+                } else if let Some(info) = &topic_info {
+                    ui.weak(info);
+                }
                 if ui.button("↻").on_hover_text("Rescan the docs folder").clicked() {
                     self.send(Cmd::RefreshTopics);
                 }
@@ -60,40 +127,73 @@ impl eframe::App for App {
                 if let Some(t) = since {
                     let s = t.elapsed().as_secs();
                     st = format!("{st} {:02}:{:02}", s / 60, s % 60);
-                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                    ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 ui.label(st);
             });
-            if let Some(e) = &error {
+            if let Some(e) = &conn_error {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
+            if let Some(e) = &error {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                    if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                        dismiss_error = true;
+                    }
+                });
+            }
         });
+        if dismiss_error {
+            self.shared.update(|s| s.error = None);
+        }
 
         egui::TopBottomPanel::bottom("hint").resizable(true).min_height(130.0).show(ctx, |ui| {
             ui.add_space(4.0);
-            match &hint {
+            egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
                 None => {
                     ui.weak("The hint will appear here (Hint button or H key).");
                 }
                 Some(h) => {
-                    if !h.sources.is_empty() {
-                        ui.weak(format!("Sources: {}", h.sources.join(", ")));
+                    let age = h.started.map(|t| t.elapsed());
+                    let stale = age.is_some_and(|a| a > self.hint_max_age) && h.done;
+                    if age.is_some() {
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                    let sources = (!h.sources.is_empty()).then(|| format!("Sources: {}", h.sources.join(", ")));
+                    let meta: Vec<String> = [sources, age.map(age_text)].into_iter().flatten().collect();
+                    if !meta.is_empty() {
+                        ui.weak(meta.join(" · "));
                     }
                     if !h.question.is_empty() {
                         ui.label(RichText::new(format!("Question: {}", h.question)).color(Color32::GRAY));
                     }
-                    let mut es = h.es.as_str();
-                    ui.add(egui::TextEdit::multiline(&mut es).font(egui::FontId::proportional(24.0)).desired_rows(2).desired_width(f32::INFINITY).frame(false));
-                    ui.label(RichText::new(&h.en).size(18.0).color(Color32::LIGHT_BLUE));
+                    let (es_color, en_color) = if stale { (Color32::GRAY, Color32::from_gray(120)) } else { (ui.visuals().text_color(), Color32::LIGHT_BLUE) };
+                    if h.done && h.es.is_empty() {
+                        // The model broke the Q/ES/EN format: show what it actually said.
+                        let msg = if h.raw.trim().is_empty() { "The model returned an empty answer." } else { h.raw.trim() };
+                        ui.label(RichText::new(msg).size(20.0).color(es_color));
+                    } else {
+                        let mut es = h.es.as_str();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut es)
+                                .font(egui::FontId::proportional(24.0))
+                                .text_color(es_color)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .frame(false),
+                        );
+                        ui.label(RichText::new(&h.en).size(18.0).color(en_color));
+                    }
                     if !h.done {
-                        ui.weak("…");
+                        ui.spinner();
                     }
                 }
-            }
+            });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            let to_bottom = std::mem::take(&mut self.to_bottom);
+            let out = egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 for seg in &segments {
                     // Your own speech: marked and tinted, never translated.
                     let me = seg.speaker == Speaker::Me;
@@ -108,10 +208,24 @@ impl eframe::App for App {
                     ui.label(es);
                     if let Some(en) = &seg.en {
                         ui.label(RichText::new(en).size(16.0).color(Color32::from_gray(150)));
+                    } else if !me && !seg.partial {
+                        // Translation in progress.
+                        ui.label(RichText::new("…").size(16.0).color(Color32::from_gray(110)));
                     }
                     ui.add_space(8.0);
                 }
+                if to_bottom {
+                    ui.scroll_to_cursor(Some(Align::BOTTOM));
+                }
             });
+            let at_bottom = out.state.offset.y + out.inner_rect.height() >= out.content_size.y - 8.0;
+            if !at_bottom {
+                egui::Area::new(egui::Id::new("latest")).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -8.0]).show(ctx, |ui| {
+                    if ui.button("↓ Latest").clicked() {
+                        self.to_bottom = true;
+                    }
+                });
+            }
         });
     }
 }
