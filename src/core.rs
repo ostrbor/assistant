@@ -19,6 +19,9 @@ pub enum Cmd {
     SelectTopic(String),
     /// Re-scan docs_dir for subfolders.
     RefreshTopics,
+    /// Capture audio only to show levels in the Audio window (nothing is sent anywhere).
+    MonitorStart,
+    MonitorStop,
 }
 
 pub enum Ev {
@@ -38,6 +41,10 @@ pub struct Core {
 impl Core {
     pub fn new(cfg: Arc<Config>, shared: Shared) -> Self {
         let llm = Llm::new(&cfg.llm);
+        shared.update(|s| {
+            audio::threshold_set(&s.meters[Speaker::Them.idx()].threshold, cfg.transcribe.silence_threshold);
+            audio::threshold_set(&s.meters[Speaker::Me.idx()].threshold, cfg.transcribe.mic_silence_threshold);
+        });
         Self { cfg, shared, index: RwLock::new(None), llm, prep: Mutex::new(None) }
     }
 
@@ -58,11 +65,17 @@ struct Session {
 pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
     let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
     let mut session: Option<Session> = None;
+    let mut monitor: Option<Session> = None;
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 None => break,
+                Some(Cmd::MonitorStart) => if session.is_none() && monitor.is_none() {
+                    monitor = Some(start_monitor(&core));
+                },
+                Some(Cmd::MonitorStop) => stop_monitor(&mut monitor, &core),
                 Some(Cmd::Start) => if session.is_none() {
+                    stop_monitor(&mut monitor, &core);
                     match start(&core, &ev_tx) {
                         Ok(s) => session = Some(s),
                         Err(e) => core.shared.update(|s| s.error = Some(e.to_string())),
@@ -106,26 +119,68 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
         s.status = "Connecting…".into();
         s.error = None;
         s.conn_error = None;
+        s.meters.iter_mut().for_each(|m| m.reset());
     });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let t = &core.cfg.transcribe;
-    let mut tasks = vec![spawn_stream(core, &key, Speaker::Them, audio::Source::Speakers, t.silence_threshold, &stop, ev_tx)];
-    if t.capture_mic {
-        tasks.push(spawn_stream(core, &key, Speaker::Me, audio::Source::Mic, t.mic_silence_threshold, &stop, ev_tx));
+    let mut tasks = vec![spawn_stream(core, &key, Speaker::Them, audio::Source::Speakers, &stop, ev_tx)];
+    if core.cfg.transcribe.capture_mic {
+        tasks.push(spawn_stream(core, &key, Speaker::Me, audio::Source::Mic, &stop, ev_tx));
     }
     Ok(Session { stop, tasks })
+}
+
+/// Index of a source in `AppState::meters`.
+fn meter_idx(source: audio::Source) -> usize {
+    match source {
+        audio::Source::Speakers => Speaker::Them.idx(),
+        audio::Source::Mic => Speaker::Me.idx(),
+    }
+}
+
+/// Captures through the gate and throws the frames away: levels only, no OpenAI connection.
+fn start_monitor(core: &Arc<Core>) -> Session {
+    core.shared.update(|s| {
+        s.monitoring = true;
+        s.meters.iter_mut().for_each(|m| m.reset());
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut sources = vec![audio::Source::Speakers];
+    if core.cfg.transcribe.capture_mic {
+        sources.push(audio::Source::Mic);
+    }
+    let tasks = sources
+        .into_iter()
+        .map(|source| {
+            let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+            let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
+            spawn_capture(&core.shared, source, threshold, &stop, tx);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} })
+        })
+        .collect();
+    Session { stop, tasks }
+}
+
+fn stop_monitor(monitor: &mut Option<Session>, core: &Arc<Core>) {
+    if let Some(m) = monitor.take() {
+        m.stop.store(true, Ordering::Relaxed);
+        for t in &m.tasks {
+            t.abort();
+        }
+    }
+    core.shared.update(|s| s.monitoring = false);
 }
 
 /// Audio capture runs on its own thread (blocking pulse API). If the device goes away
 /// (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
 /// Silence is dropped before the frames are sent to `audio_tx`.
-pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: f64, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>) {
+pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::Threshold, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>) {
     let lost = match source {
         audio::Source::Speakers => "Audio device lost",
         audio::Source::Mic => "Microphone lost",
     };
     let (stop2, shared2) = (stop.clone(), shared.clone());
+    let idx = meter_idx(source);
     std::thread::spawn(move || {
         let mut gate = audio::SilenceGate::new(threshold);
         let mut recovering = false;
@@ -140,7 +195,9 @@ pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: f64, sto
                     });
                 }
                 // An empty result (silence) counts as success; a closed receiver stops the capture.
-                gate.push(c).into_iter().all(|f| audio_tx.send(f).is_ok())
+                let out = gate.push(c);
+                shared2.update(|s| s.meters[idx].record(out.rms, out.sent));
+                out.frames.into_iter().all(|f| audio_tx.send(f).is_ok())
             });
             match res {
                 Ok(()) => break, // stopped, or the receiver is gone
@@ -163,11 +220,11 @@ fn spawn_stream(
     key: &str,
     speaker: Speaker,
     source: audio::Source,
-    threshold: f64,
     stop: &Arc<AtomicBool>,
     ev_tx: &UnboundedSender<Ev>,
 ) -> JoinHandle<()> {
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+    let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
     spawn_capture(&core.shared, source, threshold, stop, audio_tx);
 
     let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());

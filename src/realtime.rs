@@ -30,12 +30,34 @@ pub fn backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << attempt.saturating_sub(1).min(4)).min(10))
 }
 
-/// Errors that retrying cannot fix: bad key, no access, wrong URL.
+/// An error that retrying cannot fix (bad key, rejected session config).
+#[derive(Debug)]
+struct Fatal(String);
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+/// Errors that retrying cannot fix: bad key, no access, wrong URL, rejected session config.
 fn is_fatal(e: &anyhow::Error) -> bool {
-    matches!(
-        e.downcast_ref::<tungstenite::Error>(),
-        Some(tungstenite::Error::Http(resp)) if matches!(resp.status().as_u16(), 401 | 403 | 404)
-    )
+    e.downcast_ref::<Fatal>().is_some()
+        || matches!(
+            e.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Http(resp)) if matches!(resp.status().as_u16(), 401 | 403 | 404)
+        )
+}
+
+/// Adds the HTTP status and OpenAI's JSON body to a failed handshake; auth errors become fatal.
+fn describe_connect_error(e: tungstenite::Error) -> anyhow::Error {
+    let tungstenite::Error::Http(resp) = &e else { return e.into() };
+    let status = resp.status().as_u16();
+    let body = resp.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default();
+    let msg = format!("handshake failed: HTTP {status} {}", body.trim().chars().take(500).collect::<String>());
+    if matches!(status, 401 | 403 | 404) { Fatal(msg).into() } else { anyhow!(msg) }
 }
 
 /// Keeps a transcription connection alive for as long as the task runs.
@@ -56,6 +78,7 @@ pub async fn run_with_reconnect(
     loop {
         let mut up_since = None;
         let res = run(&conn, &mut audio_rx, &mut backlog, &mut up_since).await;
+        shared.update(|s| s.meters[speaker.idx()].connected = false);
         // Whatever was half-transcribed is final now: translate it and detect questions.
         finalize_partials(&shared, &ev_tx, speaker);
         let e = match res {
@@ -63,6 +86,7 @@ pub async fn run_with_reconnect(
             Err(e) => e,
         };
         if is_fatal(&e) {
+            eprintln!("realtime[{speaker:?}]: fatal: {e:#}");
             return Err(e);
         }
         if up_since.is_some_and(|t: Instant| t.elapsed() > STABLE_AFTER) {
@@ -70,6 +94,7 @@ pub async fn run_with_reconnect(
         }
         attempt += 1;
         let wait = backoff(attempt);
+        eprintln!("realtime[{speaker:?}]: connection lost, attempt {attempt}, retry in {}s: {e:#}", wait.as_secs());
         shared.update(|s| {
             s.status = format!("Reconnecting in {}s (attempt {attempt})…", wait.as_secs());
             s.conn_error = Some(format!("Connection lost: {e}"));
@@ -136,16 +161,22 @@ async fn run(
     let Conn { cfg, url, key, shared, ev_tx, speaker } = *conn;
     let mut req = url.into_client_request()?;
     req.headers_mut().insert("Authorization", format!("Bearer {key}").parse()?);
-    req.headers_mut().insert("OpenAI-Beta", "realtime=v1".parse()?);
-    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(req)).await.map_err(|_| anyhow!("connect timed out"))??;
+    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(req))
+        .await
+        .map_err(|_| anyhow!("connect timed out"))?
+        .map_err(describe_connect_error)?;
     let (mut w, mut r) = ws.split();
 
+    // GA Realtime API shape (the beta one is disabled by OpenAI: `beta_api_shape_disabled`).
     let session = json!({
-        "type": "transcription_session.update",
+        "type": "session.update",
         "session": {
-            "input_audio_format": "pcm16",
-            "input_audio_transcription": { "model": cfg.model, "language": cfg.language },
-            "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500 }
+            "type": "transcription",
+            "audio": { "input": {
+                "format": { "type": "audio/pcm", "rate": crate::audio::RATE },
+                "transcription": { "model": cfg.model, "language": cfg.language },
+                "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500 }
+            } }
         }
     });
     send(&mut w, Message::Text(session.to_string())).await?;
@@ -153,6 +184,7 @@ async fn run(
     shared.update(|s| {
         s.status = "Listening".into();
         s.conn_error = None;
+        s.meters[speaker.idx()].connected = true;
     });
 
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -161,15 +193,20 @@ async fn run(
     // Audio captured while we were disconnected goes first.
     while let Some(c) = backlog.pop_front() {
         send(&mut w, audio_msg(&c)).await?;
+        note_sent(shared, speaker, c.len());
     }
 
     let mut ping = interval(PING_EVERY);
     let mut last_rx = Instant::now();
+    // The server accepted the session config (or sent transcripts) on this connection.
+    let mut accepted = false;
+    let mut last_error: Option<String> = None;
     loop {
         tokio::select! {
             chunk = audio_rx.recv() => {
                 let Some(c) = chunk else { return Ok(()) };
                 send(&mut w, audio_msg(&c)).await?;
+                note_sent(shared, speaker, c.len());
             }
             _ = ping.tick() => {
                 if last_rx.elapsed() > DEAD_AFTER {
@@ -179,9 +216,29 @@ async fn run(
             }
             msg = r.next() => {
                 last_rx = Instant::now();
+                shared.update(|s| s.meters[speaker.idx()].last_server_msg = Some(last_rx));
                 match msg {
-                    Some(Ok(Message::Text(t))) => handle(&t, shared, ev_tx, speaker)?,
-                    Some(Ok(Message::Close(_))) | None => bail!("connection to OpenAI closed"),
+                    Some(Ok(Message::Text(t))) => match handle(&t, shared, ev_tx, speaker)? {
+                        Handled::Accepted => accepted = true,
+                        Handled::Other => {}
+                        Handled::ServerError { kind, message } => {
+                            eprintln!("realtime[{speaker:?}]: server error: {t}");
+                            let msg = format!("OpenAI: {message}");
+                            // A config rejected before anything worked cannot be fixed by reconnecting.
+                            if kind == "invalid_request_error" && !accepted {
+                                return Err(Fatal(msg).into());
+                            }
+                            last_error = Some(message);
+                        }
+                    },
+                    Some(Ok(Message::Close(frame))) => {
+                        let how = frame.map(|f| format!("{} {}", u16::from(f.code), f.reason)).unwrap_or_else(|| "no close frame".into());
+                        match &last_error {
+                            Some(m) => bail!("OpenAI closed the connection ({how}): {m}"),
+                            None => bail!("OpenAI closed the connection ({how})"),
+                        }
+                    }
+                    None => bail!("connection to OpenAI dropped"),
                     Some(Err(e)) => return Err(e.into()),
                     _ => {}
                 }
@@ -190,10 +247,32 @@ async fn run(
     }
 }
 
-fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) -> Result<()> {
+/// Records an audio chunk that went to OpenAI (for the Audio window).
+fn note_sent(shared: &Shared, speaker: Speaker, bytes: usize) {
+    shared.update(|s| {
+        let m = &mut s.meters[speaker.idx()];
+        m.bytes_sent += bytes as u64;
+        m.last_sent = Some(Instant::now());
+    });
+}
+
+enum Handled {
+    /// The server confirmed the session or sent a transcript.
+    Accepted,
+    ServerError { kind: String, message: String },
+    Other,
+}
+
+fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) -> Result<Handled> {
     let v: Value = serde_json::from_str(text)?;
     let item_id = format!("{}{}", speaker.id_prefix(), v["item_id"].as_str().unwrap_or_default());
-    match v["type"].as_str().unwrap_or_default() {
+    let ty = v["type"].as_str().unwrap_or_default();
+    let mut handled = if ty.starts_with("conversation.item.input_audio_transcription") || ty == "session.updated" {
+        Handled::Accepted
+    } else {
+        Handled::Other
+    };
+    match ty {
         "conversation.item.input_audio_transcription.delta" => {
             let delta = v["delta"].as_str().unwrap_or_default().to_string();
             shared.update(|s| {
@@ -225,10 +304,11 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
         "error" => {
             let msg = v["error"]["message"].as_str().unwrap_or("unknown error").to_string();
             shared.update(|s| s.conn_error = Some(format!("OpenAI: {msg}")));
+            handled = Handled::ServerError { kind: v["error"]["type"].as_str().unwrap_or_default().to_string(), message: msg };
         }
         _ => {}
     }
-    Ok(())
+    Ok(handled)
 }
 
 #[cfg(test)]
@@ -256,6 +336,69 @@ mod tests {
         assert!(!is_fatal(&http(429)));
         let io = anyhow::Error::from(tungstenite::Error::Io(std::io::Error::other("reset")));
         assert!(!is_fatal(&io));
+    }
+
+    fn test_cfg() -> Transcribe {
+        Transcribe {
+            api_key: String::new(),
+            api_key_env: String::new(),
+            model: "m".into(),
+            language: "es".into(),
+            silence_threshold: 300.0,
+            mic_silence_threshold: 500.0,
+            capture_mic: true,
+        }
+    }
+
+    /// Server that answers the first client message with `reply` and then closes with `close`.
+    async fn one_shot_server(reply: Value, close: Option<tungstenite::protocol::CloseFrame<'static>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(tcp).await.unwrap();
+                let _ = ws.next().await;
+                let _ = ws.send(Message::Text(reply.to_string())).await;
+                let _ = ws.close(close.clone()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn rejected_session_config_is_fatal() {
+        let err = json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad shape" } });
+        let url = one_shot_server(err, None).await;
+        let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+        let (ev_tx, _ev_rx) = unbounded_channel::<Ev>();
+        let res = timeout(Duration::from_secs(5), run_with_reconnect(&test_cfg(), &url, "k", rx, Shared::new(None), ev_tx, Speaker::Them))
+            .await
+            .expect("must not retry forever");
+        assert!(res.unwrap_err().to_string().contains("bad shape"));
+    }
+
+    #[tokio::test]
+    async fn close_reason_reaches_conn_error() {
+        let frame = tungstenite::protocol::CloseFrame { code: 4000u16.into(), reason: "going away".into() };
+        let url = one_shot_server(json!({ "type": "session.updated" }), Some(frame)).await;
+        let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+        let (ev_tx, _ev_rx) = unbounded_channel::<Ev>();
+        let shared = Shared::new(None);
+        let task = tokio::spawn({
+            let shared = shared.clone();
+            async move { run_with_reconnect(&test_cfg(), &url, "k", rx, shared, ev_tx, Speaker::Them).await }
+        });
+        let mut got = None;
+        for _ in 0..100 {
+            got = shared.read(|s| s.conn_error.clone()).filter(|e| e.contains("4000"));
+            if got.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        task.abort();
+        assert!(got.is_some_and(|e| e.contains("going away")));
     }
 
     #[tokio::test]

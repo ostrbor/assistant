@@ -4,7 +4,8 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Sample rate expected by OpenAI Realtime (pcm16, mono).
 pub const RATE: u32 = 24000;
@@ -233,35 +234,60 @@ const PRE_FRAMES: usize = 3;
 /// so it can close the utterance.
 const HANGOVER_FRAMES: usize = 10;
 
+/// Gate threshold (RMS) that can be changed while capturing; stored as `f32` bits.
+pub type Threshold = Arc<AtomicU32>;
+
+pub fn threshold(value: f64) -> Threshold {
+    Arc::new(AtomicU32::new((value as f32).to_bits()))
+}
+
+pub fn threshold_get(t: &Threshold) -> f64 {
+    f64::from(f32::from_bits(t.load(Ordering::Relaxed)))
+}
+
+pub fn threshold_set(t: &Threshold, value: f64) {
+    t.store((value as f32).to_bits(), Ordering::Relaxed);
+}
+
+/// Result of pushing one frame through the gate.
+pub struct GateOut {
+    /// Frames to send now (possibly none).
+    pub frames: Vec<Vec<u8>>,
+    /// Level of the pushed frame.
+    pub rms: f64,
+    /// The frame itself goes out (speech or its tail), not just held back as lead-in.
+    pub sent: bool,
+}
+
 /// Decides which ~100 ms frames are worth sending: speech plus a short lead-in and tail.
 /// Pure silence is dropped, so nothing is paid for it.
 pub struct SilenceGate {
-    threshold: f64,
+    threshold: Threshold,
     pre: VecDeque<Vec<u8>>,
     hangover: usize,
 }
 
 impl SilenceGate {
-    pub fn new(threshold: f64) -> Self {
+    pub fn new(threshold: Threshold) -> Self {
         Self { threshold, pre: VecDeque::new(), hangover: 0 }
     }
 
-    /// Returns the frames to send now (possibly none).
-    pub fn push(&mut self, frame: Vec<u8>) -> Vec<Vec<u8>> {
-        if rms(&frame) >= self.threshold {
+    pub fn push(&mut self, frame: Vec<u8>) -> GateOut {
+        let rms = rms(&frame);
+        if rms >= threshold_get(&self.threshold) {
             self.hangover = HANGOVER_FRAMES;
-            let mut out: Vec<Vec<u8>> = self.pre.drain(..).collect();
-            out.push(frame);
-            out
+            let mut frames: Vec<Vec<u8>> = self.pre.drain(..).collect();
+            frames.push(frame);
+            GateOut { frames, rms, sent: true }
         } else if self.hangover > 0 {
             self.hangover -= 1;
-            vec![frame]
+            GateOut { frames: vec![frame], rms, sent: true }
         } else {
             self.pre.push_back(frame);
             while self.pre.len() > PRE_FRAMES {
                 self.pre.pop_front();
             }
-            Vec::new()
+            GateOut { frames: Vec::new(), rms, sent: false }
         }
     }
 }
@@ -293,30 +319,44 @@ mod tests {
 
     #[test]
     fn silence_sends_nothing() {
-        let mut g = SilenceGate::new(300.0);
+        let mut g = SilenceGate::new(threshold(300.0));
         for _ in 0..50 {
-            assert!(g.push(frame(10)).is_empty());
+            assert!(g.push(frame(10)).frames.is_empty());
         }
     }
 
     #[test]
     fn speech_brings_lead_in_then_tail() {
-        let mut g = SilenceGate::new(300.0);
+        let mut g = SilenceGate::new(threshold(300.0));
         for _ in 0..10 {
             g.push(frame(10));
         }
         // 3 frames of lead-in (the oldest are dropped) plus the speech frame itself.
-        assert_eq!(g.push(frame(2000)).len(), PRE_FRAMES + 1);
+        assert_eq!(g.push(frame(2000)).frames.len(), PRE_FRAMES + 1);
         // Right after speech, exactly HANGOVER_FRAMES silent frames still go out.
-        let sent = (0..30).filter(|_| !g.push(frame(10)).is_empty()).count();
+        let sent = (0..30).filter(|_| !g.push(frame(10)).frames.is_empty()).count();
         assert_eq!(sent, HANGOVER_FRAMES);
     }
 
     #[test]
+    fn threshold_change_applies_to_next_frame() {
+        let t = threshold(300.0);
+        let mut g = SilenceGate::new(t.clone());
+        assert!(!g.push(frame(1000)).frames.is_empty());
+        for _ in 0..HANGOVER_FRAMES {
+            g.push(frame(10));
+        }
+        threshold_set(&t, 2000.0);
+        let out = g.push(frame(1000));
+        assert!(!out.sent && out.frames.is_empty());
+        assert_eq!(out.rms, 1000.0);
+    }
+
+    #[test]
     fn continuous_speech_is_passed_through() {
-        let mut g = SilenceGate::new(300.0);
+        let mut g = SilenceGate::new(threshold(300.0));
         for _ in 0..20 {
-            assert_eq!(g.push(frame(2000)).len(), 1);
+            assert_eq!(g.push(frame(2000)).frames.len(), 1);
         }
     }
 }

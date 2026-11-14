@@ -1,6 +1,6 @@
 use crate::core::Cmd;
 use crate::docs::FileStatus;
-use crate::state::{AppState, DocsReport, Shared, Speaker};
+use crate::state::{AppState, AudioMeter, DocsReport, METER_FRAMES, Shared, Speaker};
 use eframe::egui::{self, Align, Color32, RichText};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -17,13 +17,14 @@ pub struct App {
     /// Jump to the newest line on the next frame.
     to_bottom: bool,
     show_report: bool,
+    show_audio: bool,
     /// Identifies the report that was last auto-opened, so it pops up once per load.
     report_seen: Option<(Option<String>, usize, usize)>,
 }
 
 impl App {
     pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration) -> Self {
-        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false, show_report: false, report_seen: None }
+        Self { shared, cmd_tx, hint_max_age, clear_armed: None, to_bottom: false, show_report: false, show_audio: false, report_seen: None }
     }
 
     fn send(&self, c: Cmd) {
@@ -96,6 +97,8 @@ impl eframe::App for App {
             docs_report,
             log_path,
             topic_loading: loading,
+            meters,
+            monitoring,
         } = self.shared.read(AppState::clone);
 
         // A hint prepared in the background and not shown yet: tell the user it is ready.
@@ -230,6 +233,9 @@ impl eframe::App for App {
                         self.show_report = !self.show_report;
                     }
                 }
+                if ui.selectable_label(self.show_audio, "Audio").on_hover_text("Input levels, noise threshold, data sent to OpenAI").clicked() {
+                    self.show_audio = !self.show_audio;
+                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| match &log_path {
                     Some(path) => {
                         if ui.link("Open log").on_hover_text(path.display().to_string()).clicked() {
@@ -249,7 +255,13 @@ impl eframe::App for App {
             report_window(ctx, r, &mut self.show_report);
         }
 
-        egui::TopBottomPanel::bottom("hint").resizable(true).min_height(130.0).show(ctx, |ui| {
+        if self.show_audio {
+            let mut open = true;
+            audio_window(ctx, &meters, listening, monitoring, &self.cmd_tx, &mut open);
+            self.show_audio = open;
+        }
+
+        egui::TopBottomPanel::bottom("hint").resizable(true).min_height(180.0).show(ctx, |ui| {
             ui.add_space(4.0);
             egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
                 None => {
@@ -267,18 +279,18 @@ impl eframe::App for App {
                         ui.weak(meta.join(" · "));
                     }
                     if !h.question.is_empty() {
-                        ui.label(RichText::new(format!("Question: {}", h.question)).color(Color32::GRAY));
+                        ui.label(RichText::new(format!("Question: {}", h.question)).size(16.0).color(Color32::GRAY));
                     }
                     let (es_color, en_color) = if stale { (Color32::GRAY, Color32::from_gray(120)) } else { (ui.visuals().text_color(), Color32::LIGHT_BLUE) };
                     if h.done && h.es.is_empty() {
                         // The model broke the Q/ES/EN format: show what it actually said.
                         let msg = if h.raw.trim().is_empty() { "The model returned an empty answer." } else { h.raw.trim() };
-                        ui.label(RichText::new(msg).size(20.0).color(es_color));
+                        ui.label(RichText::new(msg).size(26.0).color(es_color));
                     } else {
                         let mut es = h.es.as_str();
                         ui.add(
                             egui::TextEdit::multiline(&mut es)
-                                .font(egui::FontId::proportional(24.0))
+                                .font(egui::FontId::proportional(26.0))
                                 .text_color(es_color)
                                 .desired_rows(2)
                                 .desired_width(f32::INFINITY)
@@ -309,7 +321,7 @@ impl eframe::App for App {
                     }
                     ui.label(es);
                     if let Some(en) = &seg.en {
-                        ui.label(RichText::new(en).size(16.0).color(Color32::from_gray(150)));
+                        ui.label(RichText::new(en).size(16.0).color(Color32::from_gray(170)));
                     } else if !me && !seg.partial {
                         // Translation in progress.
                         ui.label(RichText::new("…").size(16.0).color(Color32::from_gray(110)));
@@ -354,5 +366,120 @@ fn report_window(ctx: &egui::Context, r: &DocsReport, open: &mut bool) {
                 }
             });
         });
+    });
+}
+
+fn ago(t: Option<Instant>) -> String {
+    t.map_or_else(|| "never".into(), |t| format!("{:.1} s ago", t.elapsed().as_secs_f32()))
+}
+
+/// Value below which `frac` of the values lie (`v` must be sorted).
+fn percentile(v: &[f32], frac: f32) -> f32 {
+    v[((v.len() - 1) as f32 * frac).round() as usize]
+}
+
+/// Level bars (newest on the right, log scale) with the threshold line on top.
+fn level_chart(ui: &mut egui::Ui, m: &AudioMeter, threshold: f64) {
+    const TOP: f32 = 8000.0;
+    let y_of = |rms: f32| (1.0 + rms.max(0.0)).ln() / (1.0 + TOP).ln();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 2.0, Color32::from_gray(25));
+    let w = rect.width() / METER_FRAMES as f32;
+    let n = m.levels.len();
+    for (i, (rms, sent)) in m.levels.iter().enumerate() {
+        let x = rect.right() - (n - i) as f32 * w;
+        let h = y_of(*rms).min(1.0) * rect.height();
+        let color = if *sent { Color32::from_rgb(60, 180, 90) } else { Color32::from_gray(110) };
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - h), egui::pos2(x + w.max(1.0) - 0.5, rect.bottom())), 0.0, color);
+    }
+    let y = rect.bottom() - y_of(threshold as f32).min(1.0) * rect.height();
+    p.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.5_f32, Color32::from_rgb(230, 170, 40)));
+}
+
+fn meter_block(ui: &mut egui::Ui, title: &str, m: &AudioMeter, active: bool, listening: bool, suggest_key: &str) {
+    ui.strong(title);
+    let threshold = crate::audio::threshold_get(&m.threshold);
+    level_chart(ui, m, threshold);
+
+    // Noise floor = quiet 10 % of the last ~15 s, peak = the loudest frame.
+    let mut sorted: Vec<f32> = m.levels.iter().map(|l| l.0).collect();
+    sorted.sort_by(f32::total_cmp);
+    let now = m.levels.back().map_or(0.0, |l| l.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Now: {now:.0}"));
+        if !sorted.is_empty() {
+            let (floor, peak) = (percentile(&sorted, 0.1), *sorted.last().unwrap());
+            ui.label(format!("· noise floor: {floor:.0} · peak: {peak:.0}"));
+            let (msg, color) = if !active {
+                ("", Color32::GRAY)
+            } else if f64::from(floor) >= threshold {
+                ("Threshold is below the noise floor: silence is sent (and paid for). Raise it.", Color32::LIGHT_RED)
+            } else if f64::from(peak) < threshold {
+                ("Nothing passes the threshold: no speech here, or the threshold is too high.", Color32::from_rgb(230, 170, 40))
+            } else {
+                ("Threshold sits between noise and speech.", Color32::from_rgb(60, 180, 90))
+            };
+            ui.colored_label(color, msg);
+            if peak > floor * 2.0 && active {
+                // Deliberately low: passing some noise costs a little, cutting speech loses data.
+                let suggest = (f64::from(floor) * 1.5).round().max(20.0);
+                ui.weak(format!("Safe value (just above noise): {suggest:.0}  ({suggest_key} = {suggest:.0})"));
+            }
+        } else {
+            ui.weak("No data yet — press Test levels or Listen.");
+        }
+    });
+
+    let mut t = threshold;
+    ui.horizontal(|ui| {
+        ui.label("Threshold:");
+        if ui.add(egui::Slider::new(&mut t, 20.0..=5000.0).logarithmic(true).integer()).changed() {
+            crate::audio::threshold_set(&m.threshold, t);
+        }
+        ui.weak(format!("{suggest_key} = {t:.0}  (this session only; copy to config.toml)"));
+    });
+
+    let pct = if m.frames_total > 0 { 100.0 * m.frames_passed as f64 / m.frames_total as f64 } else { 0.0 };
+    let (conn_text, conn_color) = if !listening {
+        ("not connected (not listening)", Color32::GRAY)
+    } else if m.connected {
+        ("connected", Color32::from_rgb(60, 180, 90))
+    } else {
+        ("no connection", Color32::LIGHT_RED)
+    };
+    ui.horizontal_wrapped(|ui| {
+        let recent = m.last_sent.is_some_and(|t| t.elapsed() < Duration::from_millis(500));
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 5.0, if recent { Color32::from_rgb(60, 180, 90) } else { Color32::from_gray(80) });
+        ui.colored_label(conn_color, conn_text);
+        ui.label(format!(
+            "· passed gate {pct:.0}% ({}/{} frames) · sent {:.0} KB · last sent {} · last from server {}",
+            m.frames_passed,
+            m.frames_total,
+            m.bytes_sent as f64 / 1024.0,
+            ago(m.last_sent),
+            ago(m.last_server_msg),
+        ));
+    });
+}
+
+fn audio_window(ctx: &egui::Context, meters: &[AudioMeter; 2], listening: bool, monitoring: bool, cmd_tx: &UnboundedSender<Cmd>, open: &mut bool) {
+    ctx.request_repaint_after(Duration::from_millis(100));
+    egui::Window::new("Audio").open(open).default_width(620.0).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!listening, |ui| {
+                let label = if monitoring { "Stop test" } else { "Test levels" };
+                if ui.button(label).on_hover_text("Capture audio only to see levels; nothing is sent to OpenAI").clicked() {
+                    let _ = cmd_tx.send(if monitoring { Cmd::MonitorStop } else { Cmd::MonitorStart });
+                }
+            });
+            ui.weak("Green bars are sent to OpenAI, grey are dropped as silence. The orange line is the threshold.");
+        });
+        ui.separator();
+        let active = listening || monitoring;
+        meter_block(ui, "Speakers (them)", &meters[Speaker::Them.idx()], active, listening, "silence_threshold");
+        ui.separator();
+        meter_block(ui, "Microphone (me)", &meters[Speaker::Me.idx()], active, listening, "mic_silence_threshold");
     });
 }

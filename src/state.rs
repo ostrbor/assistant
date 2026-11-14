@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -9,6 +10,14 @@ pub enum Speaker {
 }
 
 impl Speaker {
+    /// Index into `AppState::meters`.
+    pub fn idx(self) -> usize {
+        match self {
+            Speaker::Them => 0,
+            Speaker::Me => 1,
+        }
+    }
+
     /// Keeps item ids of the two realtime sessions from colliding.
     pub fn id_prefix(self) -> &'static str {
         match self {
@@ -70,8 +79,47 @@ pub struct DocsReport {
     pub chunks: usize,
 }
 
+/// How many 100 ms frames the level history keeps (~15 s).
+pub const METER_FRAMES: usize = 150;
+
+/// Live audio statistics of one source, shown in the Audio window.
+#[derive(Clone, Default)]
+pub struct AudioMeter {
+    /// (RMS, frame goes out) per 100 ms frame, oldest first.
+    pub levels: VecDeque<(f32, bool)>,
+    /// Gate threshold; the Audio window can change it while capturing.
+    pub threshold: crate::audio::Threshold,
+    pub frames_total: u64,
+    pub frames_passed: u64,
+    pub bytes_sent: u64,
+    pub last_sent: Option<Instant>,
+    pub last_server_msg: Option<Instant>,
+    /// WebSocket to OpenAI is up.
+    pub connected: bool,
+}
+
+impl AudioMeter {
+    pub fn record(&mut self, rms: f64, sent: bool) {
+        if self.levels.len() >= METER_FRAMES {
+            self.levels.pop_front();
+        }
+        self.levels.push_back((rms as f32, sent));
+        self.frames_total += 1;
+        self.frames_passed += u64::from(sent);
+    }
+
+    /// Clears the counters for a new session; the threshold stays.
+    pub fn reset(&mut self) {
+        *self = Self { threshold: self.threshold.clone(), ..Default::default() };
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AppState {
+    /// Audio statistics: [speakers, microphone].
+    pub meters: [AudioMeter; 2],
+    /// Capturing for the Audio window without talking to OpenAI.
+    pub monitoring: bool,
     pub segments: Vec<Segment>,
     pub listening: bool,
     pub listening_since: Option<Instant>,

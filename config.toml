@@ -15,6 +15,7 @@ api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o-transcribe"
 language = "es"
 # Frames quieter than this RMS level (16-bit samples) are treated as silence and not sent
+# Tune both thresholds visually in the Audio window (bottom bar), then copy the values here
 silence_threshold = 300
 mic_silence_threshold = 500
 # Also transcribe your own voice (default input device) so hints know what you already said
