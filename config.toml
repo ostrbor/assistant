@@ -8,7 +8,9 @@ hint_window_secs = 60
 hint_max_age_secs = 20
 
 [transcribe]
-# Transcription: OpenAI Realtime (key in the OPENAI_API_KEY environment variable)
+# Transcription: OpenAI Realtime. Put your OpenAI API key here;
+# if left empty, the environment variable named below is used instead
+api_key = ""
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o-transcribe"
 language = "es"
@@ -21,6 +23,8 @@ capture_mic = true
 [llm]
 # LLM for translation and hints: any OpenAI-compatible endpoint (HF router by default)
 base_url = "https://router.huggingface.co/v1"
+# Hugging Face token (or the key of the endpoint above); if empty, the environment variable below is used
+api_key = ""
 api_key_env = "HF_TOKEN"
 translate_model = "openai/gpt-oss-20b:groq"
 # Hints go to all listed models in parallel; the first to answer wins (hedging)

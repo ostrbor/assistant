@@ -16,15 +16,23 @@ use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--version") {
+        println!("assistant {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     #[cfg(feature = "updater")]
     update::check_and_restart();
-    // A release binary may be started from any directory: fall back to its own folder.
-    if !std::path::Path::new("config.toml").exists() {
-        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
-            let _ = std::env::set_current_dir(dir);
-        }
-    }
+    let workdir = config::prepare_workdir()?;
     let cfg = Arc::new(config::Config::load("config.toml")?);
+    let keys_msg = {
+        let m = cfg.missing_keys();
+        (!m.is_empty()).then(|| {
+            format!("API key missing ({}). Add your keys to {} and restart the app.", m.join(", "), workdir.join("config.toml").display())
+        })
+    };
+    if let Some(m) = &keys_msg {
+        eprintln!("{m}");
+    }
     let args: Vec<String> = std::env::args().collect();
     let has = |name: &str| args.iter().any(|a| a == name);
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
@@ -52,6 +60,9 @@ fn main() -> Result<()> {
 
     // `--interview --topic <name> [--persona <file>] [--questions N]`: the interviewer simulator (no window).
     if has("--interview") {
+        if let Some(m) = keys_msg {
+            return Err(anyhow!(m));
+        }
         let topic = topic_arg.ok_or_else(|| anyhow!("usage: --interview --topic <name> [--persona <file>] [--questions N]"))?;
         let persona = flag("--persona")
             .map(|p| std::fs::read_to_string(p).map_err(|e| anyhow!("cannot read {p}: {e}")))
@@ -85,7 +96,10 @@ fn main() -> Result<()> {
             let auto = topic_arg.or_else(|| (topics.len() == 1).then(|| topics[0].clone()));
             shared.update(|s| {
                 s.status = "Stopped".into();
-                s.error = topics_err;
+                s.error = match (keys_msg, topics_err) {
+                    (Some(k), Some(t)) => Some(format!("{k}\n{t}")),
+                    (k, t) => k.or(t),
+                };
                 s.topics = topics;
             });
             let core = Arc::new(core::Core::new(cfg, shared.clone()));

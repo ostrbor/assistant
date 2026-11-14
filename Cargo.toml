@@ -3,10 +3,26 @@ name = "assistant"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
+description = "Live Spanish subtitles and answer hints for calls"
+license = "MIT"
+authors = ["ostrbor"]
 
 [features]
 # Enabled only for release builds: check GitHub Releases for a newer binary at startup.
 updater = ["dep:self_update"]
+
+# The .deb contains the same binary as the tar.gz release (with the self-updater). /usr/bin is
+# read-only for the user, so updates of a .deb install go to ~/assistant/bin (see src/update.rs).
+[package.metadata.deb]
+maintainer = "ostrbor"
+section = "utils"
+# Audio (PulseAudio protocol) and PDF parsing are built into the binary: only libc is needed.
+depends = "$auto"
+assets = [
+  ["target/release/assistant", "usr/bin/", "755"],
+  ["packaging/assistant.desktop", "usr/share/applications/", "644"],
+  ["README.md", "usr/share/doc/assistant/", "644"],
+]
 
 [dependencies]
 self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"], optional = true }
@@ -16,8 +32,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-libpulse-binding = "2"
-libpulse-simple-binding = "2"
+pulseaudio = "0.3"
+pdf-extract = "0.12"
 base64 = "0.22"
 anyhow = "1"
 toml = "0.8"

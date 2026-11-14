@@ -4,7 +4,7 @@
 //! microphone, and listens to the call through the default output's monitor, transcribing your
 //! answers with the same realtime client the assistant uses.
 
-use crate::config::{Config, Interview, env_key};
+use crate::config::{Config, Interview};
 use crate::llm::Llm;
 use crate::state::{Shared, Speaker};
 use crate::{audio, core, docs, realtime};
@@ -27,23 +27,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound for one answer.
 const MAX_ANSWER: Duration = Duration::from_secs(180);
 
-/// Loads a PulseAudio module unless a device of `kind` ("sinks" / "sources") named `name` exists.
-fn ensure_device(kind: &str, name: &str, module: &[&str]) -> Result<()> {
-    let list = audio::pactl(&["list", "short", kind])?;
-    if !list.lines().any(|l| l.split_whitespace().nth(1) == Some(name)) {
-        audio::pactl(&[&["load-module"], module].concat())?;
-    }
-    Ok(())
-}
-
 /// Creates the virtual sink and microphone if they do not exist yet.
 fn setup_audio() -> Result<()> {
-    ensure_device("sinks", SINK, &["module-null-sink", &format!("sink_name={SINK}"), "sink_properties=device.description=Interviewer_out"])?;
-    ensure_device(
-        "sources",
-        MIC,
-        &["module-remap-source", &format!("master={SINK}.monitor"), &format!("source_name={MIC}"), "source_properties=device.description=Interviewer_mic"],
-    )
+    audio::ensure_virtual_devices(SINK, MIC)
 }
 
 /// What the interviewer has to do on turn `turn` (0 = opening, `n` = closing).
@@ -155,7 +141,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     let icfg = &cfg.interview;
     let persona = persona_override.unwrap_or_else(|| icfg.persona.clone());
     let n = questions.unwrap_or(icfg.questions).max(1);
-    let key = env_key(&cfg.transcribe.api_key_env)?;
+    let key = cfg.transcribe.key()?;
 
     let dir = docs::topic_dir(&cfg.docs_dir, topic)?;
     let chunks = tokio::task::spawn_blocking(move || docs::load_chunks(&dir)).await??;
@@ -172,7 +158,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
 
     setup_audio()?;
     println!("Virtual microphone ready. In Zoom / Meet choose the microphone \"Interviewer_mic\".");
-    println!("Remove it afterwards with: pactl unload-module module-remap-source && pactl unload-module module-null-sink");
+    println!("They disappear when the sound server restarts (or log out); to remove them now: pactl unload-module module-remap-source && pactl unload-module module-null-sink");
     println!("Persona: {persona}\nQuestions: {n}\n");
     println!("Join the call, then press Enter to start.");
     tokio::task::spawn_blocking(|| std::io::stdin().read_line(&mut String::new())).await??;

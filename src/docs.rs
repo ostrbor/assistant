@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -39,7 +38,7 @@ pub fn topic_dir(docs_dir: &str, topic: &str) -> Result<PathBuf> {
     Ok(Path::new(docs_dir).join(topic))
 }
 
-/// Reads all PDFs in a folder (pdftotext, .txt cache next to each file) and splits them into chunks.
+/// Reads all PDFs in a folder (.txt cache next to each file) and splits them into chunks.
 pub fn load_chunks(dir: &Path) -> Result<Vec<Chunk>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("document folder not found: {}", dir.display()))?
@@ -52,7 +51,7 @@ pub fn load_chunks(dir: &Path) -> Result<Vec<Chunk>> {
     for p in &paths {
         let text = pdf_text(p)?;
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        // pdftotext separates pages with a form feed character
+        // pages are separated by a form feed character
         for (i, page) in text.split('\u{c}').enumerate() {
             chunk_page(&name, i + 1, page, &mut chunks);
         }
@@ -69,14 +68,12 @@ fn pdf_text(pdf: &Path) -> Result<String> {
     if fresh {
         return Ok(std::fs::read_to_string(&cache)?);
     }
-    let out = Command::new("pdftotext")
-        .args(["-layout"])
-        .arg(pdf)
-        .arg("-")
-        .output()
-        .context("could not run pdftotext (install poppler-utils)")?;
-    anyhow::ensure!(out.status.success(), "pdftotext failed on {}", pdf.display());
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // pdf-extract can panic on malformed files; report that as an ordinary error.
+    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_by_pages(pdf))
+        .map_err(|_| anyhow::anyhow!("cannot read {}: unsupported PDF", pdf.display()))?
+        .with_context(|| format!("cannot read {}", pdf.display()))?;
+    // Pages are separated by a form feed character (also in the cache file).
+    let text = pages.join("\u{c}");
     let _ = std::fs::write(&cache, &text);
     Ok(text)
 }

@@ -14,7 +14,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libpulse-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
@@ -30,7 +29,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libpulse-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - name: Check tag matches Cargo.toml version
         run: |
@@ -42,6 +40,12 @@ jobs:
           name=assistant-$GITHUB_REF_NAME-x86_64-unknown-linux-gnu
           # Flat archive: self_update looks for the binary at the archive root.
           tar czf $name.tar.gz -C target/release assistant -C ../.. config.toml README.md
+      - name: Build .deb (same binary as in the tar.gz, it updates itself)
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
       - uses: softprops/action-gh-release@v2
         with:
-          files: assistant-*.tar.gz
+          files: |
+            assistant-*.tar.gz
+            target/debian/*.deb

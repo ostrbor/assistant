@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Zoom Assistant
+Comment=Live Spanish subtitles and answer hints for calls
+Exec=assistant
+Terminal=false
+Categories=AudioVideo;Utility;

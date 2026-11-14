@@ -286,6 +286,7 @@ mod tests {
         let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
         let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
         let cfg = Transcribe {
+            api_key: String::new(),
             api_key_env: String::new(),
             model: "m".into(),
             language: "es".into(),

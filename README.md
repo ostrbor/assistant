@@ -10,7 +10,7 @@ The window stays on top of other windows. The other person is captured from what
 ## How it works
 
 ```
-speaker output ──► PulseAudio monitor ─┐  (silence dropped)
+speaker output ──► sound-server monitor ─┐  (silence dropped)
 microphone ──────► default input ──────┴► OpenAI Realtime (one session each) ──► subtitles
                                                                   │
                           finished sentence ──► LLM (translation) ──► English line
@@ -20,38 +20,46 @@ microphone ──────► default input ──────┴► OpenAI R
 
 - **Transcription:** OpenAI Realtime API over a WebSocket (words arrive while the person is still speaking).
 - **Translation and hints:** any OpenAI-compatible chat endpoint. The default is the [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers) router with open models (`gpt-oss`). Hints are sent to two providers in parallel and the first answer wins.
-- **Document search:** no vector database. PDFs are converted with `pdftotext`, cut into ~200-word chunks and indexed in memory with BM25. Only the top 5 chunks go to the LLM, which keeps hints fast and cheap.
+- **Document search:** no vector database. PDF text is extracted by the app itself, cut into ~200-word chunks and indexed in memory with BM25. Only the top 5 chunks go to the LLM, which keeps hints fast and cheap.
 - **Reconnects:** if the connection drops, the app reconnects on its own (1, 2, 4, 8, then 10 s between attempts) and keeps the last ~5 s of audio. It stops only on errors retrying can't fix, such as an invalid API key.
 
 ## Requirements
 
-- Ubuntu 22.04 or newer (or another Linux with glibc ≥ 2.35) with PipeWire or PulseAudio (the app records the default output's `.monitor` source via `pactl`)
-- Rust ≥ 1.88 via `rustup` (the apt `rustc` on Ubuntu is too old). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`.
-- Development packages and tools:
-  ```bash
-  # Debian / Ubuntu
-  sudo apt install libpulse-dev poppler-utils pkg-config
-  ```
+- Ubuntu 22.04 or newer (or another Linux with glibc ≥ 2.35) with PipeWire or PulseAudio (the app talks to the sound server directly and records the default output's `.monitor` source). Nothing else has to be installed: audio and PDF handling are built into the binary.
+- Only to build from source: Rust ≥ 1.88 via `rustup` (the apt `rustc` on Ubuntu is too old). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`. No development packages are needed.
 - An [OpenAI API key](https://platform.openai.com/api-keys) (transcription only)
 - A [Hugging Face token](https://huggingface.co/settings/tokens/new?tokenType=fineGrained) with the *Make calls to Inference Providers* permission, and either purchased credits or a PRO subscription (translation and hints)
+
+## Install the .deb (recommended)
+
+Download `assistant_X.Y.Z_amd64.deb` from the GitHub Releases page and install it:
+
+```bash
+sudo apt install ./assistant_X.Y.Z_amd64.deb
+assistant            # or start "Zoom Assistant" from the applications menu
+```
+
+On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you.
+
+The app updates itself (see *Auto-update* below). `/usr/bin` is read-only for you, so updates are stored in `~/assistant/bin/assistant`, and the installed `assistant` command hands over to that copy automatically. Installing a newer .deb later also works: the newest of the two versions runs. Your `~/assistant/` is kept, also when you remove the package.
 
 ## Install from a release (no Rust needed)
 
 ```bash
-sudo apt install libpulse0 pulseaudio-utils poppler-utils
 tar xzf assistant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz   # from the GitHub Releases page
 ./assistant
 ```
 
 Release binaries are built on Ubuntu 22.04, so they run on 22.04 and newer. `config.toml` is read from the current folder, or from the folder of the binary if there is none there.
 
-**Auto-update.** On start, release builds check the latest GitHub release of `ostrbor/assistant`. If it is newer, the app downloads it, replaces its own binary and restarts. Your `config.toml` and `docs/` are not touched. The binary's folder must be writable. If you are offline, the check is skipped with a warning. To skip it, use `./assistant --no-update` or `ASSISTANT_NO_UPDATE=1`. Builds from source (`cargo run`) never update themselves.
+**Auto-update.** On start, release builds check the latest GitHub release of `ostrbor/assistant`. If it is newer, the app downloads it, replaces its own binary and restarts. Your `config.toml` and `docs/` are not touched. If the binary's folder is not writable (a .deb install), the new version is placed in `~/assistant/bin/` instead. If you are offline, the check is skipped with a warning. To skip it, use `./assistant --no-update` or `ASSISTANT_NO_UPDATE=1`. Builds from source (`cargo run`) never update themselves.
 
 **Releasing.** Bump `version` in `Cargo.toml`, then `git tag vX.Y.Z && git push --tags`. GitHub Actions builds the binary and publishes the release.
 
 ## Setup
 
 ```bash
+# Keys go into config.toml ([transcribe] api_key, [llm] api_key) or, if those are empty, into
 export OPENAI_API_KEY=sk-...
 export HF_TOKEN=hf_...
 
@@ -101,6 +109,8 @@ Everything is in `config.toml`:
 | `docs_dir` | Root folder that contains the per-call subfolders. |
 | `hint_window_secs` | How much recent speech the hint generator sees (default 60). |
 | `hint_max_age_secs` | A hint prepared in the background older than this is regenerated when you press *Hint* (default 20). |
+| `[transcribe] api_key` | OpenAI API key. If empty, the variable named in `api_key_env` is used. |
+| `[llm] api_key` | Key of the LLM endpoint (Hugging Face token by default). If empty, the variable named in `api_key_env` is used. |
 | `[transcribe] model, language` | Realtime transcription model and the spoken language. |
 | `[transcribe] silence_threshold, mic_silence_threshold` | RMS level (16-bit samples, default 300 and 500) below which audio from the speakers / the microphone counts as silence and is not sent. Raise it if background noise keeps the stream open, lower it if quiet speech is cut off. |
 | `[transcribe] capture_mic` | `true` (default) also transcribes your own voice, so hints know what you already said. |
@@ -167,8 +177,8 @@ Notes:
 - **The other person's words appear as `Me:`.** Their voice leaks from the speakers into your microphone. Use headphones.
 - **Subtitles cut off quiet speech, or the stream never goes quiet.** Tune `silence_threshold` / `mic_silence_threshold`.
 - **`LLM timed out`.** The provider gave no first token within 15 s (or went quiet for 20 s). Press *Hint* again or check the provider.
-- **`environment variable OPENAI_API_KEY is not set`.** Export `OPENAI_API_KEY` in the shell that launches the app.
-- **`LLM token is not set`** (hint error, or `[translation error: …]` under subtitles). Export `HF_TOKEN` (or the variable named in `[llm] api_key_env`) in the shell that launches the app.
+- **`API key missing …` / `OpenAI API key is not set`.** Put the key into `config.toml` (`[transcribe] api_key`) and restart, or export `OPENAI_API_KEY` in the shell that launches the app.
+- **`LLM token is not set`** (hint error, or `[translation error: …]` under subtitles). Set `[llm] api_key` in `config.toml` (or export `HF_TOKEN`, or the variable named in `[llm] api_key_env`) and restart.
 - **`Transcription: HTTP error: 401`.** The OpenAI key is invalid or has no access to the Realtime API. The app stops instead of retrying.
 - **Translation shows `[translation error: …]`.** Check `HF_TOKEN`, your credits, and the model name in `config.toml`.
 - **`No text found in <folder>`.** The PDFs are scans without a text layer.

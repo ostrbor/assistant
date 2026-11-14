@@ -1,4 +1,4 @@
-use crate::config::{Config, env_key};
+use crate::config::Config;
 use crate::llm::Llm;
 use crate::search::Index;
 use crate::state::{Shared, Speaker};
@@ -99,7 +99,7 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
 }
 
 fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
-    let key = env_key(&core.cfg.transcribe.api_key_env)?;
+    let key = core.cfg.transcribe.key()?;
     core.shared.update(|s| {
         s.listening = true;
         s.listening_since = Some(Instant::now());

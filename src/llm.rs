@@ -32,12 +32,12 @@ impl Llm {
         Self {
             http: reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build().expect("HTTP client"),
             url: format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
-            key: config::env_key(&cfg.api_key_env).ok(),
+            key: cfg.key(),
         }
     }
 
     fn key(&self) -> Result<&str> {
-        self.key.as_deref().ok_or_else(|| anyhow!("LLM token is not set (see api_key_env in config.toml)"))
+        self.key.as_deref().ok_or_else(|| anyhow!("LLM token is not set (set [llm] api_key in config.toml)"))
     }
 
     fn body(model: &str, messages: &Value, stream: bool, max_tokens: u32) -> Value {
