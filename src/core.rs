@@ -1,7 +1,7 @@
 use crate::config::{Config, env_key};
 use crate::llm::Llm;
 use crate::search::Index;
-use crate::state::Shared;
+use crate::state::{Shared, Speaker};
 use crate::{audio, hint, realtime};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,8 @@ pub struct Core {
 
 struct Session {
     stop: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    /// One transcription task per audio source (speakers, and the microphone if enabled).
+    tasks: Vec<JoinHandle<()>>,
 }
 
 pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
@@ -88,24 +89,48 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
     });
 
     let stop = Arc::new(AtomicBool::new(false));
+    let t = &core.cfg.transcribe;
+    let mut tasks = vec![spawn_stream(core, &key, Speaker::Them, audio::Source::Speakers, t.silence_threshold, &stop, ev_tx)];
+    if t.capture_mic {
+        tasks.push(spawn_stream(core, &key, Speaker::Me, audio::Source::Mic, t.mic_silence_threshold, &stop, ev_tx));
+    }
+    Ok(Session { stop, tasks })
+}
+
+/// Capture thread + transcription task for one audio source. Silence is dropped before it is sent.
+fn spawn_stream(
+    core: &Arc<Core>,
+    key: &str,
+    speaker: Speaker,
+    source: audio::Source,
+    threshold: f64,
+    stop: &Arc<AtomicBool>,
+    ev_tx: &UnboundedSender<Ev>,
+) -> JoinHandle<()> {
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+    let lost = match source {
+        audio::Source::Speakers => "Audio device lost",
+        audio::Source::Mic => "Microphone lost",
+    };
 
     // Audio capture runs on its own thread (blocking pulse API). If the device goes away
-    // (e.g. headphones switched), keep retrying; the default sink is re-read on each attempt.
+    // (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
     let (stop2, shared2) = (stop.clone(), core.shared.clone());
     std::thread::spawn(move || {
+        let mut gate = audio::SilenceGate::new(threshold);
         let mut recovering = false;
         while !stop2.load(Ordering::Relaxed) {
-            let res = audio::capture(&stop2, |c| {
+            let res = audio::capture(source, &stop2, |c| {
                 if recovering {
                     recovering = false;
                     shared2.update(|s| {
-                        if s.status.starts_with("Audio device lost") {
+                        if s.status.starts_with(lost) {
                             s.status = "Listening".into();
                         }
                     });
                 }
-                audio_tx.send(c).is_ok()
+                // An empty result (silence) counts as success; a closed receiver stops the capture.
+                gate.push(c).into_iter().all(|f| audio_tx.send(f).is_ok())
             });
             match res {
                 Ok(()) => break, // stopped, or the receiver is gone
@@ -114,29 +139,30 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
                         break;
                     }
                     recovering = true;
-                    shared2.update(|s| s.status = format!("Audio device lost, retrying… ({e})"));
+                    shared2.update(|s| s.status = format!("{lost}, retrying… ({e})"));
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             }
         }
     });
 
-    let (core2, ev3) = (core.clone(), ev_tx.clone());
-    let task = tokio::spawn(async move {
+    let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());
+    tokio::spawn(async move {
         let shared = core2.shared.clone();
-        if let Err(e) = realtime::run_with_reconnect(&core2.cfg.transcribe, realtime::REALTIME_URL, &key, audio_rx, shared, ev3.clone()).await {
+        if let Err(e) = realtime::run_with_reconnect(&core2.cfg.transcribe, realtime::REALTIME_URL, &key, audio_rx, shared, ev2.clone(), speaker).await {
             // Only fatal errors (bad key, no access) get here; everything else is retried.
-            let _ = ev3.send(Ev::Error(format!("Transcription: {e}")));
+            let _ = ev2.send(Ev::Error(format!("Transcription: {e}")));
         }
-    });
-    Ok(Session { stop, task })
+    })
 }
 
 /// Stops capture and closes the WebSocket: nothing is spent while stopped.
 fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
     if let Some(s) = session.take() {
         s.stop.store(true, Ordering::Relaxed);
-        s.task.abort();
+        for t in &s.tasks {
+            t.abort();
+        }
     }
     core.shared.update(|s| {
         s.listening = false;
@@ -152,9 +178,23 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
     let found = core.shared.read(|s| {
         let idx = s.segments.iter().position(|x| x.item_id == item_id)?;
         let ctx: Vec<String> = s.segments[..idx].iter().rev().filter(|x| !x.partial).take(2).map(|x| x.es.clone()).collect();
-        Some((s.segments[idx].es.clone(), ctx.into_iter().rev().collect::<Vec<_>>()))
+        Some((s.segments[idx].speaker, s.segments[idx].es.clone(), ctx.into_iter().rev().collect::<Vec<_>>()))
     });
-    let Some((es, ctx)) = found else { return };
+    let Some((speaker, es, ctx)) = found else { return };
+
+    // The user spoke: no translation needed, and a hint prepared before their answer is stale.
+    // A hint that is on screen (possibly still streaming) is left alone.
+    if speaker == Speaker::Me {
+        let mut shown = false;
+        core.shared.update(|s| {
+            shown = s.pending_shown;
+            s.pending = None;
+        });
+        if !shown && let Some(h) = core.prep.lock().unwrap().take() {
+            h.abort();
+        }
+        return;
+    }
 
     // Translation does not block receiving the next utterances.
     let (core2, id) = (core.clone(), item_id.to_string());

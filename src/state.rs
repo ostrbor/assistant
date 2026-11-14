@@ -1,9 +1,27 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Who is talking: the other side (speaker output) or the user (microphone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speaker {
+    Them,
+    Me,
+}
+
+impl Speaker {
+    /// Keeps item ids of the two realtime sessions from colliding.
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            Speaker::Them => "them:",
+            Speaker::Me => "me:",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Segment {
     pub item_id: String,
+    pub speaker: Speaker,
     pub es: String,
     pub en: Option<String>,
     pub partial: bool,

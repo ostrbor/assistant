@@ -15,6 +15,27 @@ pub struct Transcribe {
     pub api_key_env: String,
     pub model: String,
     pub language: String,
+    /// RMS level (i16 units) of a 100 ms frame below which speaker audio counts as silence.
+    #[serde(default = "default_silence_threshold")]
+    pub silence_threshold: f64,
+    /// Same for the microphone, which is usually noisier.
+    #[serde(default = "default_mic_silence_threshold")]
+    pub mic_silence_threshold: f64,
+    /// Also transcribe your own voice (default input device) so hints know what you already said.
+    #[serde(default = "default_true")]
+    pub capture_mic: bool,
+}
+
+fn default_silence_threshold() -> f64 {
+    300.0
+}
+
+fn default_mic_silence_threshold() -> f64 {
+    500.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

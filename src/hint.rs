@@ -1,12 +1,13 @@
 use crate::core::Core;
-use crate::state::Hint;
+use crate::state::{Hint, Speaker};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SYSTEM: &str = "You help the user answer questions in a Spanish-language video call. The user speaks Spanish only at A1-A2 level. \
-You receive the recent transcript of the call (the other person speaks to the user) and excerpts from the user's own documents. \
-Find the last question addressed to the user and answer it in the first person, using ONLY facts from the excerpts. \
+You receive the recent transcript of the call, where lines starting with 'Them:' are the other person and lines starting with 'Me:' are the user, and excerpts from the user's own documents. \
+Find the last question from Them that the user (Me) has not fully answered yet and answer it in the first person, using ONLY facts from the excerpts. \
+If the user already answered it, suggest a short natural addition or continuation that does not repeat what the user said. \
 Use 2-3 very short, simple Spanish sentences (A1-A2: present tense, basic vocabulary, no subjunctive). \
 If the excerpts do not contain the answer, say so in simple Spanish (for example: 'No tengo esa informacion ahora. Lo reviso y le respondo.'). \
 Output exactly three lines and nothing else:\nQ: <the question, short, in English>\nES: <the answer in Spanish>\nEN: <English translation of the answer>";
@@ -58,14 +59,25 @@ fn generate(core: &Arc<Core>, show: bool) {
 async fn run(core: &Arc<Core>, show: bool) -> anyhow::Result<()> {
     let index = core.index.read().unwrap().clone().ok_or_else(|| anyhow::anyhow!("select a document folder first"))?;
     let window = Duration::from_secs(core.cfg.hint_window_secs);
-    let lines: Vec<(String, bool)> = core.shared.read(|s| {
-        s.segments.iter().filter(|x| x.at.elapsed() <= window).map(|x| (x.es.clone(), x.partial)).collect()
+    let lines: Vec<(Speaker, String)> = core.shared.read(|s| {
+        s.segments.iter().filter(|x| x.at.elapsed() <= window).map(|x| (x.speaker, x.es.clone())).collect()
     });
     anyhow::ensure!(!lines.is_empty(), "no recognized speech in the last {} s", core.cfg.hint_window_secs);
 
-    let transcript: Vec<&str> = lines.iter().map(|(t, _)| t.as_str()).collect();
-    let focus = lines.iter().rev().find(|(t, _)| is_question(t)).map(|(t, _)| t.as_str()).unwrap_or(*transcript.last().unwrap());
-    let all = transcript.join(" ");
+    let transcript: Vec<String> = lines
+        .iter()
+        .map(|(sp, t)| format!("{}: {t}", if *sp == Speaker::Me { "Me" } else { "Them" }))
+        .collect();
+    // Search is driven by what the other person said, not by the user's own answers.
+    let them: Vec<&str> = lines.iter().filter(|(sp, _)| *sp == Speaker::Them).map(|(_, t)| t.as_str()).collect();
+    let focus = them
+        .iter()
+        .rev()
+        .find(|t| is_question(t))
+        .or(them.last())
+        .copied()
+        .unwrap_or(lines.last().unwrap().1.as_str());
+    let all = if them.is_empty() { focus.to_string() } else { them.join(" ") };
     let found = index.search(&[(focus, 3.0), (&all, 1.0)], 5);
 
     let mut sources: Vec<String> = Vec::new();

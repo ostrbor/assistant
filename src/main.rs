@@ -8,11 +8,21 @@ mod realtime;
 mod search;
 mod state;
 mod ui;
+#[cfg(feature = "updater")]
+mod update;
 
 use anyhow::{Result, anyhow};
 use std::sync::{Arc, Mutex, RwLock};
 
 fn main() -> Result<()> {
+    #[cfg(feature = "updater")]
+    update::check_and_restart();
+    // A release binary may be started from any directory: fall back to its own folder.
+    if !std::path::Path::new("config.toml").exists() {
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            let _ = std::env::set_current_dir(dir);
+        }
+    }
     let cfg = Arc::new(config::Config::load("config.toml")?);
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str);

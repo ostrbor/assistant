@@ -1,5 +1,5 @@
 use crate::core::Cmd;
-use crate::state::Shared;
+use crate::state::{Shared, Speaker};
 use eframe::egui::{self, Color32, Key, Modifiers, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -95,7 +95,13 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 for seg in &segments {
-                    let mut es = RichText::new(&seg.es).size(22.0);
+                    // Your own speech: marked and tinted, never translated.
+                    let me = seg.speaker == Speaker::Me;
+                    let text = if me { format!("Me: {}", seg.es) } else { seg.es.clone() };
+                    let mut es = RichText::new(text).size(22.0);
+                    if me {
+                        es = es.color(Color32::from_rgb(120, 200, 140));
+                    }
                     if seg.partial {
                         es = es.italics().color(Color32::GRAY);
                     }

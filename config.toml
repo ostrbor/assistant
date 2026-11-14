@@ -12,6 +12,11 @@ hint_max_age_secs = 20
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o-transcribe"
 language = "es"
+# Frames quieter than this RMS level (16-bit samples) are treated as silence and not sent
+silence_threshold = 300
+mic_silence_threshold = 500
+# Also transcribe your own voice (default input device) so hints know what you already said
+capture_mic = true
 
 [llm]
 # LLM for translation and hints: any OpenAI-compatible endpoint (HF router by default)

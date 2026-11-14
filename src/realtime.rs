@@ -1,6 +1,6 @@
 use crate::config::Transcribe;
 use crate::core::Ev;
-use crate::state::{Segment, Shared};
+use crate::state::{Segment, Shared, Speaker};
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use futures::{Sink, SinkExt, StreamExt};
@@ -40,6 +40,7 @@ fn is_fatal(e: &anyhow::Error) -> bool {
 
 /// Keeps a transcription connection alive for as long as the task runs.
 /// Returns only on a fatal error (or when the audio channel closes).
+/// One call per audio source; `speaker` tags the segments it produces.
 pub async fn run_with_reconnect(
     cfg: &Transcribe,
     url: &str,
@@ -47,14 +48,15 @@ pub async fn run_with_reconnect(
     mut audio_rx: UnboundedReceiver<Vec<u8>>,
     shared: Shared,
     ev_tx: UnboundedSender<Ev>,
+    speaker: Speaker,
 ) -> Result<()> {
     let mut backlog: VecDeque<Vec<u8>> = VecDeque::new();
     let mut attempt = 0u32;
     loop {
         let mut up_since = None;
-        let res = run(cfg, url, key, &mut audio_rx, &mut backlog, &shared, &ev_tx, &mut up_since).await;
+        let res = run(cfg, url, key, &mut audio_rx, &mut backlog, &shared, &ev_tx, speaker, &mut up_since).await;
         // Whatever was half-transcribed is final now: translate it and detect questions.
-        finalize_partials(&shared, &ev_tx);
+        finalize_partials(&shared, &ev_tx, speaker);
         let e = match res {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -86,10 +88,11 @@ fn trim_backlog(rx: &mut UnboundedReceiver<Vec<u8>>, backlog: &mut VecDeque<Vec<
     }
 }
 
-fn finalize_partials(shared: &Shared, ev_tx: &UnboundedSender<Ev>) {
+/// Only touches this speaker's segments: the other session may still be mid-utterance.
+fn finalize_partials(shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) {
     let mut ids = Vec::new();
     shared.update(|s| {
-        for seg in &mut s.segments {
+        for seg in s.segments.iter_mut().filter(|x| x.speaker == speaker) {
             if seg.partial {
                 seg.partial = false;
                 if !seg.es.trim().is_empty() {
@@ -97,7 +100,7 @@ fn finalize_partials(shared: &Shared, ev_tx: &UnboundedSender<Ev>) {
                 }
             }
         }
-        s.segments.retain(|x| !x.es.trim().is_empty());
+        s.segments.retain(|x| x.speaker != speaker || !x.es.trim().is_empty());
     });
     for id in ids {
         let _ = ev_tx.send(Ev::Completed(id));
@@ -122,6 +125,7 @@ async fn run(
     backlog: &mut VecDeque<Vec<u8>>,
     shared: &Shared,
     ev_tx: &UnboundedSender<Ev>,
+    speaker: Speaker,
     up_since: &mut Option<Instant>,
 ) -> Result<()> {
     let mut req = url.into_client_request()?;
@@ -170,7 +174,7 @@ async fn run(
             msg = r.next() => {
                 last_rx = Instant::now();
                 match msg {
-                    Some(Ok(Message::Text(t))) => handle(&t, shared, ev_tx)?,
+                    Some(Ok(Message::Text(t))) => handle(&t, shared, ev_tx, speaker)?,
                     Some(Ok(Message::Close(_))) | None => bail!("connection to OpenAI closed"),
                     Some(Err(e)) => return Err(e.into()),
                     _ => {}
@@ -188,9 +192,9 @@ where
     Ok(())
 }
 
-fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>) -> Result<()> {
+fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) -> Result<()> {
     let v: Value = serde_json::from_str(text)?;
-    let item_id = v["item_id"].as_str().unwrap_or_default().to_string();
+    let item_id = format!("{}{}", speaker.id_prefix(), v["item_id"].as_str().unwrap_or_default());
     match v["type"].as_str().unwrap_or_default() {
         "conversation.item.input_audio_transcription.delta" => {
             let delta = v["delta"].as_str().unwrap_or_default().to_string();
@@ -198,7 +202,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>) -> Result<()
                 if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == item_id) {
                     seg.es.push_str(&delta);
                 } else {
-                    s.segments.push(Segment { item_id, es: delta, en: None, partial: true, at: Instant::now() });
+                    s.segments.push(Segment { item_id, speaker, es: delta, en: None, partial: true, at: Instant::now() });
                 }
             });
         }
@@ -212,7 +216,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>) -> Result<()
                     seg.es = full.clone();
                     seg.partial = false;
                 } else {
-                    s.segments.push(Segment { item_id: id, es: full.clone(), en: None, partial: false, at: Instant::now() });
+                    s.segments.push(Segment { item_id: id, speaker, es: full.clone(), en: None, partial: false, at: Instant::now() });
                 }
             });
             if !full.is_empty() {
@@ -284,7 +288,14 @@ mod tests {
         let shared = Shared::new(None);
         let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
         let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
-        let cfg = Transcribe { api_key_env: String::new(), model: "m".into(), language: "es".into() };
+        let cfg = Transcribe {
+            api_key_env: String::new(),
+            model: "m".into(),
+            language: "es".into(),
+            silence_threshold: 300.0,
+            mic_silence_threshold: 500.0,
+            capture_mic: true,
+        };
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let (seen2, shared2) = (seen.clone(), shared.clone());
@@ -302,7 +313,7 @@ mod tests {
         });
         let task = tokio::spawn({
             let shared = shared.clone();
-            async move { run_with_reconnect(&cfg, &url, "k", audio_rx, shared, ev_tx).await }
+            async move { run_with_reconnect(&cfg, &url, "k", audio_rx, shared, ev_tx, Speaker::Them).await }
         });
 
         let mut completed = Vec::new();
@@ -312,10 +323,10 @@ mod tests {
                 completed.push(id);
             }
         }
-        assert_eq!(completed, ["a", "b"]); // "a" finalized from a partial after the drop
+        assert_eq!(completed, ["them:a", "them:b"]); // "a" finalized from a partial after the drop
         assert_eq!(connections.load(Ordering::SeqCst), 2);
         let segs = shared.read(|s| s.segments.iter().map(|x| (x.item_id.clone(), x.es.clone(), x.partial)).collect::<Vec<_>>());
-        assert_eq!(segs, [("a".into(), "Hola".into(), false), ("b".into(), "Buenos dias".into(), false)]);
+        assert_eq!(segs, [("them:a".into(), "Hola".into(), false), ("them:b".into(), "Buenos dias".into(), false)]);
         assert!(seen.lock().unwrap().iter().any(|s| s.starts_with("Reconnecting")), "statuses: {:?}", seen.lock().unwrap());
 
         drop(audio_tx);

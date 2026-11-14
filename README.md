@@ -2,15 +2,16 @@
 
 A small desktop window for Linux that helps you follow a Spanish-language call (Zoom or anything else that plays through your speakers):
 
-- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with an English translation under each finished sentence. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on.
-- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. If the other person's sentence looks like a question, the hint is prepared in the background, so it is usually already there when you press the button.
+- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with an English translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
+- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. If the other person's sentence looks like a question, the hint is prepared in the background, so it is usually already there when you press the button.
 
-The window stays on top of other windows. Your own microphone is never captured, only what plays through the speakers.
+The window stays on top of other windows. The other person is captured from what plays through the speakers, you from your default microphone. **Use headphones**: through speakers, their voice leaks into your microphone and shows up as `Me:` lines. To turn the microphone off, set `capture_mic = false`.
 
 ## How it works
 
 ```
-speaker output ──► PulseAudio monitor ──► OpenAI Realtime (transcription) ──► subtitles
+speaker output ──► PulseAudio monitor ─┐  (silence dropped)
+microphone ──────► default input ──────┴► OpenAI Realtime (one session each) ──► subtitles
                                                                   │
                           finished sentence ──► LLM (translation) ──► English line
                                                                   │
@@ -24,8 +25,8 @@ speaker output ──► PulseAudio monitor ──► OpenAI Realtime (transcrip
 
 ## Requirements
 
-- Linux with PipeWire or PulseAudio (the app records the default output's `.monitor` source via `pactl`)
-- Rust toolchain (`rustup`). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`.
+- Ubuntu 22.04 or newer (or another Linux with glibc ≥ 2.35) with PipeWire or PulseAudio (the app records the default output's `.monitor` source via `pactl`)
+- Rust ≥ 1.85 via `rustup` (the apt `rustc` on Ubuntu 22.04 is too old). If `cargo` is not found, add `~/.cargo/bin` to your `PATH`.
 - Development packages and tools:
   ```bash
   # Debian / Ubuntu
@@ -33,6 +34,20 @@ speaker output ──► PulseAudio monitor ──► OpenAI Realtime (transcrip
   ```
 - An [OpenAI API key](https://platform.openai.com/api-keys) (transcription only)
 - A [Hugging Face token](https://huggingface.co/settings/tokens/new?tokenType=fineGrained) with the *Make calls to Inference Providers* permission, and either purchased credits or a PRO subscription (translation and hints)
+
+## Install from a release (no Rust needed)
+
+```bash
+sudo apt install libpulse0 pulseaudio-utils poppler-utils
+tar xzf assistant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz   # from the GitHub Releases page
+./assistant
+```
+
+Release binaries are built on Ubuntu 22.04, so they run on 22.04 and newer. `config.toml` is read from the current folder, or from the folder of the binary if there is none there.
+
+**Auto-update.** On start, release builds check the latest GitHub release of `ostrbor/assistant`. If it is newer, the app downloads it, replaces its own binary and restarts. Your `config.toml` and `docs/` are not touched. The binary's folder must be writable. If you are offline, the check is skipped with a warning. To skip it, use `./assistant --no-update` or `ASSISTANT_NO_UPDATE=1`. Builds from source (`cargo run`) never update themselves.
+
+**Releasing.** Bump `version` in `Cargo.toml`, then `git tag vX.Y.Z && git push --tags`. GitHub Actions builds the binary and publishes the release.
 
 ## Setup
 
@@ -87,6 +102,8 @@ Everything is in `config.toml`:
 | `hint_window_secs` | How much recent speech the hint generator sees (default 60). |
 | `hint_max_age_secs` | A hint prepared in the background older than this is regenerated when you press *Hint* (default 20). |
 | `[transcribe] model, language` | Realtime transcription model and the spoken language. |
+| `[transcribe] silence_threshold, mic_silence_threshold` | RMS level (16-bit samples, default 300 and 500) below which audio from the speakers / the microphone counts as silence and is not sent. Raise it if background noise keeps the stream open, lower it if quiet speech is cut off. |
+| `[transcribe] capture_mic` | `true` (default) also transcribes your own voice, so hints know what you already said. |
 | `[llm] base_url, api_key_env` | Any OpenAI-compatible endpoint and the environment variable holding its key. |
 | `[llm] translate_model` | Model for sentence translation (pick a fast one). |
 | `[llm] hint_models` | Models tried in parallel for hints; the first to answer wins. A `:provider` suffix pins a Hugging Face provider, e.g. `openai/gpt-oss-120b:groq`. |
@@ -95,7 +112,7 @@ Model and provider names change over time. If you see an HTTP error in the red l
 
 ## Cost
 
-Rough figures; check current pricing. Transcription is the main cost, on the order of a few tenths of a dollar per hour while *Listen* is on. Translation and hints send only a few thousand tokens per request, which amounts to cents per call.
+Rough figures; check current pricing. Transcription is the main cost, on the order of a few tenths of a dollar per hour of audio sent while *Listen* is on. Silence is not sent, and the microphone is a second stream (only your own speech counts), so the total depends on how much is actually said. Translation and hints send only a few thousand tokens per request, which amounts to cents per call.
 
 ## Checking your setup
 
@@ -117,7 +134,10 @@ runs the unit tests and an integration test that drops a local WebSocket connect
 ## Troubleshooting
 
 - **No subtitles, `test.wav` is silent.** The app records the monitor of the *default* output device. Make sure Zoom plays through the default output (check with `pactl get-default-sink`) or change the default in your sound settings.
-- **Your own voice is not transcribed.** Only speaker output is captured, not the microphone. That is intended.
+- **Your own voice is not transcribed.** Check `capture_mic` and `pactl get-default-source`; if the level is low, lower `mic_silence_threshold`. A missing microphone shows `Microphone lost, retrying…` while the speaker stream keeps working.
+- **The other person's words appear as `Me:`.** Their voice leaks from the speakers into your microphone. Use headphones.
+- **Subtitles cut off quiet speech, or the stream never goes quiet.** Tune `silence_threshold` / `mic_silence_threshold`.
+- **`LLM timed out`.** The provider gave no first token within 15 s (or went quiet for 20 s). Press *Hint* again or check the provider.
 - **`environment variable … is not set`.** Export `OPENAI_API_KEY` and `HF_TOKEN` in the shell that launches the app.
 - **`Transcription: HTTP error: 401`.** The OpenAI key is invalid or has no access to the Realtime API. The app stops instead of retrying.
 - **Translation shows `[translation error: …]`.** Check `HF_TOKEN`, your credits, and the model name in `config.toml`.

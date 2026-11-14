@@ -2,7 +2,17 @@ use crate::config;
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use serde_json::{Value, json};
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Whole non-streaming request (translation).
+const TRANSLATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// No model has produced a first token within this time.
+const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// The winning stream went quiet for this long.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Llm {
     http: reqwest::Client,
@@ -19,7 +29,7 @@ enum StreamEv {
 impl Llm {
     pub fn new(cfg: &config::Llm) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build().expect("HTTP client"),
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             key: config::env_key(&cfg.api_key_env).ok(),
         }
@@ -51,6 +61,7 @@ impl Llm {
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(key)
+            .timeout(TRANSLATE_TIMEOUT)
             .json(&Self::body(model, &messages, false, 600))
             .send()
             .await?;
@@ -83,7 +94,9 @@ impl Llm {
 
         let (mut winner, mut text, mut failed) = (None, String::new(), 0);
         let result = loop {
-            let Some((i, ev)) = rx.recv().await else { break Err(anyhow!("empty LLM response")) };
+            let wait = if winner.is_none() { FIRST_TOKEN_TIMEOUT } else { IDLE_TIMEOUT };
+            let Ok(next) = timeout(wait, rx.recv()).await else { break Err(anyhow!("LLM timed out")) };
+            let Some((i, ev)) = next else { break Err(anyhow!("empty LLM response")) };
             match ev {
                 StreamEv::Delta(d) => {
                     if winner.is_none() {
