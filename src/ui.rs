@@ -27,6 +27,43 @@ impl App {
     }
 }
 
+/// Icons are painted as shapes: the default egui font has no glyphs for ● and ■.
+#[derive(Clone, Copy)]
+enum Icon {
+    Dot,
+    Square,
+}
+
+/// A button with an optional painted icon followed by text, centered together.
+/// `fill` / `text_color` of `None` keep the default button look.
+fn icon_button(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, fill: Option<Color32>, text_color: Option<Color32>, size: egui::Vec2) -> egui::Response {
+    let mut btn = egui::Button::new("").min_size(size);
+    if let Some(f) = fill {
+        btn = btn.fill(f);
+    }
+    let resp = ui.add(btn);
+    let color = text_color.unwrap_or_else(|| ui.style().interact(&resp).text_color());
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(18.0), color);
+    let (d, gap) = (12.0, 8.0);
+    let icon_w = if icon.is_some() { d + gap } else { 0.0 };
+    let mut x = resp.rect.center().x - (icon_w + galley.size().x) / 2.0;
+    let cy = resp.rect.center().y;
+    if let Some(icon) = icon {
+        let c = egui::pos2(x + d / 2.0, cy);
+        match icon {
+            Icon::Dot => {
+                ui.painter().circle_filled(c, d / 2.0, color);
+            }
+            Icon::Square => {
+                ui.painter().rect_filled(egui::Rect::from_center_size(c, egui::vec2(d, d)), 2.0, color);
+            }
+        }
+        x += icon_w;
+    }
+    ui.painter().galley(egui::pos2(x, cy - galley.size().y / 2.0), galley, color);
+    resp
+}
+
 fn age_text(d: Duration) -> String {
     let s = d.as_secs();
     if s < 5 {
@@ -69,28 +106,25 @@ impl eframe::App for App {
         top.show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let btn_size = egui::vec2(140.0, 36.0);
-                let (label, fill) = if listening {
+                let (icon, label, fill) = if listening {
                     // Gentle pulse so "listening" is noticeable at a glance.
                     let t = ctx.input(|i| i.time) as f32;
                     let k = 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.2).sin();
                     ctx.request_repaint_after(Duration::from_millis(33));
                     let lerp = |a: f32, b: f32| (a + (b - a) * k) as u8;
-                    ("■ Stop", Color32::from_rgb(lerp(160.0, 230.0), lerp(30.0, 60.0), lerp(30.0, 60.0)))
+                    (Icon::Square, "Stop", Color32::from_rgb(lerp(160.0, 230.0), lerp(30.0, 60.0), lerp(30.0, 60.0)))
                 } else {
-                    ("● Listen", Color32::from_rgb(40, 140, 70))
+                    (Icon::Dot, "Listen", Color32::from_rgb(40, 140, 70))
                 };
-                let listen_btn = egui::Button::new(RichText::new(label).size(18.0).strong().color(Color32::WHITE)).fill(fill).min_size(btn_size);
-                if ui.add(listen_btn).clicked() {
+                if icon_button(ui, Some(icon), label, Some(fill), Some(Color32::WHITE), btn_size).clicked() {
                     self.send(if listening { Cmd::Stop } else { Cmd::Start });
                 }
-                let hint_label = if ready { "Hint ●" } else { "Hint" };
-                let mut hint_btn = egui::Button::new(RichText::new(hint_label).size(18.0)).min_size(btn_size);
-                if ready {
-                    hint_btn = egui::Button::new(RichText::new(hint_label).size(18.0).strong().color(Color32::WHITE))
-                        .fill(Color32::from_rgb(40, 140, 70))
-                        .min_size(btn_size);
-                }
-                if ui.add(hint_btn).on_hover_text("Show the hint; press again for a new one").clicked() {
+                let hint_btn = if ready {
+                    icon_button(ui, Some(Icon::Dot), "Hint", Some(Color32::from_rgb(40, 140, 70)), Some(Color32::WHITE), btn_size)
+                } else {
+                    icon_button(ui, None, "Hint", None, None, btn_size)
+                };
+                if hint_btn.on_hover_text("Show the hint; press again for a new one").clicked() {
                     self.send(Cmd::AskHint);
                 }
                 if preparing {
@@ -139,7 +173,9 @@ impl eframe::App for App {
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 if listening {
-                    ui.label(RichText::new(format!("● REC {st}")).strong().color(Color32::LIGHT_RED));
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, Color32::LIGHT_RED);
+                    ui.label(RichText::new(format!("REC {st}")).strong().color(Color32::LIGHT_RED));
                 } else {
                     ui.label(st);
                 }
@@ -150,7 +186,7 @@ impl eframe::App for App {
             if let Some(e) = &error {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(Color32::LIGHT_RED, e);
-                    if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                    if ui.small_button("x").on_hover_text("Dismiss").clicked() {
                         dismiss_error = true;
                     }
                 });

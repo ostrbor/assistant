@@ -1,6 +1,6 @@
-# Zoom Assistant
+# Assistant
 
-A small desktop window for Linux that helps you follow a Spanish-language call (Zoom or anything else that plays through your speakers):
+A small desktop window for Linux that helps you follow a Spanish-language call (Zoom, Google Meet or anything else that plays through your speakers):
 
 - **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with an English translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
 - **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. If the other person's sentence looks like a question, the hint is prepared in the background, so it is usually already there when you press the button.
@@ -36,7 +36,7 @@ Download `assistant_X.Y.Z_amd64.deb` from the GitHub Releases page and install i
 
 ```bash
 sudo apt install ./assistant_X.Y.Z_amd64.deb
-assistant            # or start "Zoom Assistant" from the applications menu
+assistant            # or start "Assistant" from the applications menu
 ```
 
 On the first start the app creates `~/assistant/` with a default `config.toml` and an empty `docs/`. Open `~/assistant/config.toml`, put your keys into `[transcribe] api_key` (OpenAI) and `[llm] api_key` (Hugging Face), and restart the app. Until the keys are set, the app shows a message saying so. Put your PDFs into `~/assistant/docs/<topic>/`. The config file is readable only by you.

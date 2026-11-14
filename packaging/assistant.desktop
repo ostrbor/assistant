@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Zoom Assistant
+Name=Assistant
 Comment=Live Spanish subtitles and answer hints for calls
 Exec=assistant
 Terminal=false
