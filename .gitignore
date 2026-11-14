@@ -5,3 +5,4 @@ assistant.log*
 /docs/*
 !/docs/.gitkeep
 /sessions/
+/issues/
