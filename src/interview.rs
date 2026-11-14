@@ -175,7 +175,8 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     };
 
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(60)).build()?;
-    let llm = Llm::new(&cfg.llm);
+    // The simulator's own requests are not part of any session cost report.
+    let llm = Llm::new(&cfg.llm, std::sync::Arc::new(crate::usage::UsageMeter::new(crate::usage::Prices::new(&cfg.prices))));
     let silence = Duration::from_secs_f64(icfg.answer_silence_secs);
     let mut seen: HashSet<String> = HashSet::new();
     let mut history: Vec<String> = Vec::new();

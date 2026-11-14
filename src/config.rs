@@ -11,6 +11,9 @@ pub struct Config {
     pub hint_chunks: usize,
     pub transcribe: Transcribe,
     pub llm: Llm,
+    /// Overrides of the built-in prices used in the session cost report, by model name.
+    #[serde(default)]
+    pub prices: std::collections::HashMap<String, crate::usage::Price>,
     #[serde(default)]
     pub interview: Interview,
 }

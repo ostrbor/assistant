@@ -1,5 +1,6 @@
 //! Per-session debug record: `sessions/<local time>/session.log` (transcript, translations,
-//! hints with sources, errors) and raw audio (`them.wav`, `me.wav`).
+//! hints with sources, errors), raw audio (`them.wav`, `me.wav`) and the cost report
+//! (`usage.csv` per request, `cost.txt` summary).
 
 use crate::config::Config;
 use crate::state::{Hint, Speaker};
@@ -114,6 +115,19 @@ impl SessionLog {
         self.write("stopped");
     }
 
+    /// The folder of this session.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Writes `cost.txt` and the total at the end of `session.log`.
+    pub fn cost(&self, s: &crate::usage::Summary) {
+        if let Err(e) = std::fs::write(self.dir.join("cost.txt"), s.to_text()) {
+            self.error(&format!("cost.txt: {e}"));
+        }
+        self.write(&format!("COST {} (details: cost.txt, usage.csv)", s.headline()));
+    }
+
     pub fn wav(&self, name: &str) -> Result<WavWriter> {
         WavWriter::create(&self.dir.join(name))
     }
@@ -202,6 +216,22 @@ mod tests {
         assert!(text.contains("topic: topic"));
         assert!(text.contains("#1 THEM: ¿Cuántos años?") && text.contains("#1 EN: How many years?"));
         assert!(text.contains("#2 ME  : Cinco.") && text.contains("stopped"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn cost_report_is_written_next_to_the_log() {
+        let d = tmp("cost");
+        let cfg: Config = toml::from_str(&std::fs::read_to_string("config.toml").unwrap()).unwrap();
+        let log = SessionLog::create(&d, &cfg, None).unwrap();
+        let meter = crate::usage::UsageMeter::new(crate::usage::Prices::new(&cfg.prices));
+        meter.begin(Some(log.dir()));
+        let summary = meter.summary(&cfg.transcribe.model, [60.0, 0.0]);
+        log.cost(&summary);
+        let cost = std::fs::read_to_string(log.dir().join("cost.txt")).unwrap();
+        assert!(cost.starts_with("Session cost") && cost.contains("gpt-4o-transcribe"), "{cost}");
+        assert!(log.dir().join("usage.csv").exists());
+        assert!(std::fs::read_to_string(log.dir().join("session.log")).unwrap().contains("COST ≈ $0.0060"));
         let _ = std::fs::remove_dir_all(d);
     }
 

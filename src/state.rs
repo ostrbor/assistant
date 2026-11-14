@@ -121,6 +121,9 @@ impl AudioMeter {
 pub struct AppState {
     /// Audio statistics: [speakers, microphone].
     pub meters: [AudioMeter; 2],
+    /// Cost of the session that was stopped last, and whether its window is open.
+    pub cost_report: Option<crate::usage::Summary>,
+    pub cost_open: bool,
     /// Capturing for the Audio window without talking to OpenAI.
     pub monitoring: bool,
     pub segments: Vec<Segment>,

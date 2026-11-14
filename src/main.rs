@@ -11,6 +11,7 @@ mod record;
 mod search;
 mod state;
 mod ui;
+mod usage;
 #[cfg(feature = "updater")]
 mod update;
 

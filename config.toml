@@ -35,6 +35,17 @@ translate_model = "openai/gpt-oss-20b:groq"
 # Hints go to all listed models in parallel; the first to answer wins (hedging)
 hint_models = ["openai/gpt-oss-120b:cerebras", "openai/gpt-oss-120b:groq"]
 
+# Prices for the session cost report (cost.txt and the window after Stop). Built-in list prices are
+# used for the models above; uncomment and edit to override them or to add another model.
+# USD per 1M tokens; per_minute (USD per minute of audio) is only a fallback for transcription.
+# [prices."openai/gpt-oss-120b:groq"]
+# input = 0.15
+# output = 0.75
+# [prices."gpt-4o-transcribe"]
+# input = 2.5
+# output = 10.0
+# per_minute = 0.006
+
 [interview]
 # Interviewer simulator (`--interview`), run on the machine that joins the call as the other person.
 # Who the interviewer is (can be replaced with `--persona <file>`)

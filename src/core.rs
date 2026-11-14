@@ -3,6 +3,7 @@ use crate::llm::Llm;
 use crate::record::{SessionLog, WavWriter};
 use crate::search::Index;
 use crate::state::{Shared, Speaker};
+use crate::usage::{Call, Outcome, Prices, Purpose, UsageMeter};
 use crate::{audio, hint, realtime};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,8 @@ pub enum Cmd {
 pub enum Ev {
     Completed(String),
     Error(String),
+    /// OpenAI reported what one transcribed utterance cost.
+    TranscribeUsage { speaker: Speaker, input_tokens: u64, output_tokens: u64, seconds: f64 },
 }
 
 pub struct Core {
@@ -36,6 +39,8 @@ pub struct Core {
     /// Index of the selected document folder; None until one is selected.
     pub index: RwLock<Option<Arc<Index>>>,
     pub llm: Llm,
+    /// Paid requests of the current session (for the cost report).
+    pub usage: Arc<UsageMeter>,
     pub prep: Mutex<Option<AbortHandle>>,
     /// Debug record of the current Listen session (text + audio).
     pub rec: Mutex<Option<Arc<SessionLog>>>,
@@ -43,12 +48,13 @@ pub struct Core {
 
 impl Core {
     pub fn new(cfg: Arc<Config>, shared: Shared) -> Self {
-        let llm = Llm::new(&cfg.llm);
+        let usage = Arc::new(UsageMeter::new(Prices::new(&cfg.prices)));
+        let llm = Llm::new(&cfg.llm, usage.clone());
         shared.update(|s| {
             audio::threshold_set(&s.meters[Speaker::Them.idx()].threshold, cfg.transcribe.silence_threshold);
             audio::threshold_set(&s.meters[Speaker::Me.idx()].threshold, cfg.transcribe.mic_silence_threshold);
         });
-        Self { cfg, shared, index: RwLock::new(None), llm, prep: Mutex::new(None), rec: Mutex::new(None) }
+        Self { cfg, shared, index: RwLock::new(None), llm, usage, prep: Mutex::new(None), rec: Mutex::new(None) }
     }
 
     /// The record of the current session, if one is open.
@@ -107,6 +113,20 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
             },
             ev = ev_rx.recv() => match ev {
                 Some(Ev::Completed(id)) => on_completed(&core, &id),
+                Some(Ev::TranscribeUsage { speaker, input_tokens, output_tokens, seconds }) => {
+                    if session.is_some() {
+                        core.usage.record(Call {
+                            purpose: if speaker == Speaker::Me { Purpose::TranscribeMe } else { Purpose::TranscribeThem },
+                            model: core.cfg.transcribe.model.clone(),
+                            input_tokens,
+                            output_tokens,
+                            audio_secs: seconds,
+                            duration: std::time::Duration::ZERO,
+                            outcome: Outcome::Won,
+                            estimated: false,
+                        });
+                    }
+                }
                 Some(Ev::Error(e)) => {
                     if session.is_some() {
                         if let Some(r) = core.rec() {
@@ -154,6 +174,7 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
         }
     };
     let (them_wav, me_wav) = (wav("them.wav"), if core.cfg.transcribe.capture_mic { wav("me.wav") } else { None });
+    core.usage.begin(rec.as_ref().map(|r| r.dir()));
     *core.rec.lock().unwrap() = rec;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -275,18 +296,33 @@ fn spawn_stream(
     })
 }
 
+/// 24 kHz, 16-bit, mono.
+const BYTES_PER_SEC: f64 = audio::RATE as f64 * 2.0;
+
 /// Stops capture and closes the WebSocket: nothing is spent while stopped.
 fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
-    if let Some(s) = session.take() {
+    let running = session.take();
+    if let Some(s) = &running {
         s.stop.store(true, Ordering::Relaxed);
         for t in &s.tasks {
             t.abort();
         }
     }
+    // Audio actually sent per source, read before the meters are touched again.
+    let audio_sent = core.shared.read(|s| [Speaker::Them, Speaker::Me].map(|k| s.meters[k.idx()].bytes_sent as f64 / BYTES_PER_SEC));
+    // Only a session that was really running has a cost to report.
+    let cost = running.is_some().then(|| core.usage.summary(&core.cfg.transcribe.model, audio_sent));
     if let Some(r) = core.rec.lock().unwrap().take() {
         r.stopped();
+        if let Some(c) = &cost {
+            r.cost(c);
+        }
     }
     core.shared.update(|s| {
+        if cost.is_some() {
+            s.cost_open = true;
+            s.cost_report = cost;
+        }
         s.listening = false;
         s.listening_since = None;
         s.status = "Stopped".into();

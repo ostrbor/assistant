@@ -295,6 +295,9 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
                     s.segments.push(Segment { item_id: item_id.clone(), speaker, es: full.clone(), en: None, partial: false, at: Instant::now() });
                 }
             });
+            if let Some((input_tokens, output_tokens, seconds)) = crate::usage::parse_transcribe_usage(&v) {
+                let _ = ev_tx.send(Ev::TranscribeUsage { speaker, input_tokens, output_tokens, seconds });
+            }
             if !full.is_empty() {
                 let _ = ev_tx.send(Ev::Completed(item_id));
             }
