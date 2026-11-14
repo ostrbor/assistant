@@ -90,8 +90,8 @@ cargo run --release -- --topic project_x     # preselect a document folder
 
 | Control | Action |
 |---|---|
-| **Listen / Stop** (`Space`) | Start or stop capturing and transcribing. Nothing is sent while stopped. |
-| **Hint** (`H`) | Show the answer hint for the latest question. |
+| **Listen / Stop** | Start or stop capturing and transcribing. Nothing is sent while stopped. |
+| **Hint** | Show the answer hint for the latest question. |
 | **Docs** drop-down | Choose which folder under `docs/` to answer from. You can switch at any time; the index rebuilds in a moment. |
 | **↻** | Rescan `docs/` after adding a folder. |
 | **Clear** | Clear the transcript, hint and errors. |
@@ -100,7 +100,7 @@ If there is a single folder under `docs/`, it is selected automatically. Pick a 
 
 Hint panel layout: the sources (file and page), the question as the app understood it (in English), the Spanish answer in large type, and its English translation below.
 
-A typical call: start the app and choose the folder. Press `Space` when the conversation turns to you, press `H` after a question, and press `Space` again when the conversation moves on to someone else.
+A typical call: start the app and choose the folder. Press *Listen* when the conversation turns to you, press *Hint* after a question, and press *Stop* when the conversation moves on to someone else.
 
 ## Configuration
 

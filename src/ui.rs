@@ -1,6 +1,6 @@
 use crate::core::Cmd;
 use crate::state::{AppState, Shared, Speaker};
-use eframe::egui::{self, Align, Color32, Key, Modifiers, RichText};
+use eframe::egui::{self, Align, Color32, RichText};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -40,15 +40,6 @@ fn age_text(d: Duration) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Hotkeys (consumed before widgets so Space does not click a focused button),
-        // but not while a popup (the folder list) is open or a text field has focus.
-        let typing = ctx.memory(|m| m.any_popup_open()) || ctx.wants_keyboard_input();
-        let (space, h) = if typing {
-            (false, false)
-        } else {
-            (ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space)), ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::H)))
-        };
-
         let AppState {
             segments,
             listening,
@@ -70,18 +61,36 @@ impl eframe::App for App {
         let preparing = ready && pending.as_ref().is_some_and(|p| !p.done);
 
         let mut dismiss_error = false;
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        let mut top = egui::TopBottomPanel::top("top");
+        if listening {
+            // Whole bar tinted red while recording.
+            top = top.frame(egui::Frame::side_top_panel(&ctx.style()).fill(Color32::from_rgb(70, 20, 20)));
+        }
+        top.show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let label = if listening { "■ Stop (Space)" } else { "● Listen (Space)" };
-                if ui.button(RichText::new(label).size(18.0)).clicked() || space {
+                let btn_size = egui::vec2(140.0, 36.0);
+                let (label, fill) = if listening {
+                    // Gentle pulse so "listening" is noticeable at a glance.
+                    let t = ctx.input(|i| i.time) as f32;
+                    let k = 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.2).sin();
+                    ctx.request_repaint_after(Duration::from_millis(33));
+                    let lerp = |a: f32, b: f32| (a + (b - a) * k) as u8;
+                    ("■ Stop", Color32::from_rgb(lerp(160.0, 230.0), lerp(30.0, 60.0), lerp(30.0, 60.0)))
+                } else {
+                    ("● Listen", Color32::from_rgb(40, 140, 70))
+                };
+                let listen_btn = egui::Button::new(RichText::new(label).size(18.0).strong().color(Color32::WHITE)).fill(fill).min_size(btn_size);
+                if ui.add(listen_btn).clicked() {
                     self.send(if listening { Cmd::Stop } else { Cmd::Start });
                 }
-                let hint_label = if ready { "Hint ● (H)" } else { "Hint (H)" };
-                let mut hint_text = RichText::new(hint_label).size(18.0);
+                let hint_label = if ready { "Hint ●" } else { "Hint" };
+                let mut hint_btn = egui::Button::new(RichText::new(hint_label).size(18.0)).min_size(btn_size);
                 if ready {
-                    hint_text = hint_text.color(Color32::LIGHT_GREEN);
+                    hint_btn = egui::Button::new(RichText::new(hint_label).size(18.0).strong().color(Color32::WHITE))
+                        .fill(Color32::from_rgb(40, 140, 70))
+                        .min_size(btn_size);
                 }
-                if ui.button(hint_text).on_hover_text("Show the hint; press again for a new one").clicked() || h {
+                if ui.add(hint_btn).on_hover_text("Show the hint; press again for a new one").clicked() {
                     self.send(Cmd::AskHint);
                 }
                 if preparing {
@@ -129,7 +138,11 @@ impl eframe::App for App {
                     st = format!("{st} {:02}:{:02}", s / 60, s % 60);
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
-                ui.label(st);
+                if listening {
+                    ui.label(RichText::new(format!("● REC {st}")).strong().color(Color32::LIGHT_RED));
+                } else {
+                    ui.label(st);
+                }
             });
             if let Some(e) = &conn_error {
                 ui.colored_label(Color32::LIGHT_RED, e);
@@ -151,7 +164,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
                 None => {
-                    ui.weak("The hint will appear here (Hint button or H key).");
+                    ui.weak("The hint will appear here (Hint button).");
                 }
                 Some(h) => {
                     let age = h.started.map(|t| t.elapsed());
