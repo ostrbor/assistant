@@ -406,44 +406,18 @@ fn report_window(ctx: &egui::Context, r: &DocsReport, open: &mut bool) {
     });
 }
 
-/// Shown right after Stop: what the session cost, per model.
+/// Shown right after Stop: only the approximate total; the breakdown is in the session folder.
 fn cost_window(ctx: &egui::Context, c: &crate::usage::Summary, open: &mut bool) {
-    use crate::usage::{clock, money};
-    egui::Window::new("Session cost").open(open).default_width(560.0).show(ctx, |ui| {
+    use crate::usage::money;
+    egui::Window::new("Session cost").open(open).default_width(320.0).show(ctx, |ui| {
         let plus = if c.unpriced { "+" } else { "" };
-        ui.label(RichText::new(format!("≈ {}{plus}", money(c.total))).size(28.0).strong());
-        ui.weak(format!("Session length {}", clock(c.elapsed)));
-        ui.add_space(8.0);
-        egui::Grid::new("cost").num_columns(5).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-            for h in ["Model", "Calls", "Tokens in/out", "Busy", "Cost"] {
-                ui.strong(h);
-            }
-            ui.end_row();
-            for l in &c.lines {
-                let mark = if l.estimated { "~" } else { "" };
-                ui.label(format!("{} ({})", l.model, l.what));
-                ui.label(l.requests.to_string());
-                if l.what == "transcribe" && l.input == 0 && l.output == 0 {
-                    ui.label(format!("{} audio", clock(Duration::from_secs_f64(l.audio_secs))));
-                } else {
-                    ui.label(format!("{mark}{} / {mark}{}", l.input, l.output));
-                }
-                ui.label(clock(l.busy));
-                match l.cost {
-                    Some(v) => ui.label(format!("{mark}{}", money(v))),
-                    None => ui.colored_label(Color32::from_rgb(230, 170, 40), "no price"),
-                };
-                ui.end_row();
-            }
-        });
-        ui.add_space(8.0);
-        if c.estimated {
-            ui.weak("~ estimated: the provider reported no token counts.");
-        }
+        ui.label(RichText::new(format!("≈ {}{plus}", money(c.total))).size(32.0).strong());
         if c.unpriced {
-            ui.colored_label(Color32::from_rgb(230, 170, 40), "Some models have no price: add [prices] to config.toml.");
+            ui.add_space(6.0);
+            ui.colored_label(Color32::from_rgb(230, 170, 40), "Some models have no price, so the total is incomplete (see [prices] in config.toml).");
         }
-        ui.weak("Approximate. Details: cost.txt and usage.csv in the session folder.");
+        ui.add_space(6.0);
+        ui.weak("Breakdown by model and request: cost.txt and usage.csv in the session folder.");
     });
 }
 
