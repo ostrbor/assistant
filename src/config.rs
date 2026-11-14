@@ -6,6 +6,9 @@ pub struct Config {
     pub docs_dir: String,
     pub hint_window_secs: u64,
     pub hint_max_age_secs: u64,
+    /// How many of the best matching document excerpts the hint generator sees.
+    #[serde(default = "default_hint_chunks")]
+    pub hint_chunks: usize,
     pub transcribe: Transcribe,
     pub llm: Llm,
     #[serde(default)]
@@ -66,6 +69,10 @@ fn default_silence_threshold() -> f64 {
 
 fn default_mic_silence_threshold() -> f64 {
     500.0
+}
+
+fn default_hint_chunks() -> usize {
+    8
 }
 
 fn default_true() -> bool {

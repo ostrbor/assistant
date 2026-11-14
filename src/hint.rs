@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 const SYSTEM: &str = "You help the user answer questions in a Spanish-language video call. The user speaks Spanish only at A1-A2 level. \
 You receive the recent transcript of the call, where lines starting with 'Them:' are the other person and lines starting with 'Me:' are the user, and excerpts from the user's own documents. \
-Find the last question from Them that the user (Me) has not fully answered yet and answer it in the first person, using ONLY facts from the excerpts. \
+Find the last question from Them that the user (Me) has not fully answered yet and answer it in the first person. \
 If the user already answered it, suggest a short natural addition or continuation that does not repeat what the user said. \
 Use 2-3 very short, simple Spanish sentences (A1-A2: present tense, basic vocabulary, no subjunctive). \
-If the excerpts do not contain the answer, say so in simple Spanish (for example: 'No tengo esa informacion ahora. Lo reviso y le respondo.'). \
-Output exactly three lines and nothing else:\nQ: <the question, short, in English>\nES: <the answer in Spanish>\nEN: <English translation of the answer>";
+If the excerpts contain the answer, base the answer ONLY on them and write 'SRC: DOCS'. \
+If they do not contain it (or only a part of it), NEVER say that you have no information: answer the question yourself from your general knowledge, correctly and briefly, and write 'SRC: OWN'. \
+For personal facts about the user that are not in the excerpts (employers, dates, numbers, names, years of experience) do not invent specifics: give a plain generic answer and write 'SRC: OWN'. \
+Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in English>\nES: <the answer in Spanish>\nEN: <English translation of the answer>";
 
 pub fn is_question(es: &str) -> bool {
     let t = es.trim().to_lowercase();
@@ -87,7 +89,7 @@ async fn run(core: &Arc<Core>, show: bool) -> anyhow::Result<()> {
         .copied()
         .unwrap_or(lines.last().unwrap().1.as_str());
     let all = if them.is_empty() { focus.to_string() } else { them.join(" ") };
-    let found = index.search(&[(focus, 3.0), (&all, 1.0)], 5);
+    let found = index.search(&[(focus, 3.0), (&all, 1.0)], core.cfg.hint_chunks.max(1));
 
     let mut sources: Vec<String> = Vec::new();
     let mut excerpts = String::new();

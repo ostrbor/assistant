@@ -7,6 +7,10 @@ hint_window_secs = 60
 # After how many seconds a hint prepared in the background counts as stale
 hint_max_age_secs = 20
 
+# How many of the best matching excerpts of your documents the hint generator gets
+# (each is up to 200 words). More excerpts: fewer "not found" cases, a slower and costlier hint.
+hint_chunks = 8
+
 [transcribe]
 # Transcription: OpenAI Realtime. Put your OpenAI API key here;
 # if left empty, the environment variable named below is used instead

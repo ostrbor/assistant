@@ -43,17 +43,19 @@ pub struct Hint {
     pub es: String,
     pub en: String,
     pub raw: String,
+    /// The answer is not from the user's documents: the model produced it from its own knowledge.
+    pub own: bool,
     pub done: bool,
     pub sources: Vec<String>,
     pub started: Option<Instant>,
 }
 
 impl Hint {
-    /// Parses streamed text in the format `Q: … / ES: … / EN: …`.
+    /// Parses streamed text in the format `SRC: DOCS|OWN / Q: … / ES: … / EN: …`.
     pub fn apply_raw(&mut self, raw: &str) {
         self.raw = raw.to_string();
-        const PREFIXES: [&str; 3] = ["Q:", "ES:", "EN:"];
-        let mut fields: [String; 3] = Default::default();
+        const PREFIXES: [&str; 4] = ["Q:", "ES:", "EN:", "SRC:"];
+        let mut fields: [String; 4] = Default::default();
         let mut cur = None;
         for line in raw.lines().map(str::trim) {
             let mut rest = line;
@@ -68,8 +70,9 @@ impl Hint {
             }
             fields[i].push_str(rest.trim());
         }
-        let [question, es, en] = fields;
+        let [question, es, en, src] = fields;
         (self.question, self.es, self.en) = (question, es, en);
+        self.own = src.trim().to_uppercase().starts_with("OWN");
     }
 }
 
@@ -175,6 +178,21 @@ mod tests {
         let mut h = Hint::default();
         h.apply_raw("Tengo cinco años.");
         assert!(h.es.is_empty() && h.raw == "Tengo cinco años.");
+    }
+
+    #[test]
+    fn source_marker_is_parsed() {
+        let mut h = Hint::default();
+        h.apply_raw("SRC: OWN\nQ: What is a tautology?\nES: Es una fórmula siempre verdadera.\nEN: It is always true.");
+        assert!(h.own);
+        assert_eq!((h.question.as_str(), h.es.as_str()), ("What is a tautology?", "Es una fórmula siempre verdadera."));
+        h.apply_raw("SRC: DOCS\nQ: x\nES: y\nEN: z");
+        assert!(!h.own);
+        // No marker (old format or still streaming): treated as from the documents.
+        h.apply_raw("Q: x\nES: y");
+        assert!(!h.own);
+        h.apply_raw("SRC: O");
+        assert!(!h.own);
     }
 
     #[test]
