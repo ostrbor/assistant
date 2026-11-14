@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::llm::Llm;
-use crate::record::{SessionLog, WavWriter};
+use crate::record::{SessionLog, SttTiming, WavWriter};
 use crate::search::Index;
 use crate::state::{Shared, Speaker};
 use crate::usage::{Call, Outcome, Prices, Purpose, UsageMeter};
@@ -27,10 +27,18 @@ pub enum Cmd {
 }
 
 pub enum Ev {
-    Completed(String),
+    /// An utterance is final. `stt` says how long it took to become text (None: unknown).
+    Completed { id: String, stt: Option<SttTiming> },
     Error(String),
     /// OpenAI reported what one transcribed utterance cost.
     TranscribeUsage { speaker: Speaker, input_tokens: u64, output_tokens: u64, seconds: f64 },
+    /// A service or timing event: it goes to `events.jsonl`, and to `session.log` when `text` is not empty.
+    Note { speaker: Speaker, tag: &'static str, kind: &'static str, text: String, fields: serde_json::Value },
+}
+
+/// Builds an [`Ev::Note`]. `tag` is the word before the speaker in `session.log` (CONN, AUDIO, STT).
+pub fn note(speaker: Speaker, tag: &'static str, kind: &'static str, text: String, fields: serde_json::Value) -> Ev {
+    Ev::Note { speaker, tag, kind, text, fields }
 }
 
 pub struct Core {
@@ -112,7 +120,18 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
                 }
             },
             ev = ev_rx.recv() => match ev {
-                Some(Ev::Completed(id)) => on_completed(&core, &id),
+                Some(Ev::Completed { id, stt }) => on_completed(&core, &id, stt),
+                Some(Ev::Note { speaker, tag, kind, text, mut fields }) => {
+                    if session.is_some() {
+                        if let Some(o) = fields.as_object_mut() {
+                            o.insert("speaker".into(), if speaker == Speaker::Me { "me" } else { "them" }.into());
+                        }
+                        core.usage.event(kind, fields);
+                        if let (Some(r), false) = (core.rec(), text.is_empty()) {
+                            r.note(&format!("{tag} {}: {text}", if speaker == Speaker::Me { "ME" } else { "THEM" }));
+                        }
+                    }
+                }
                 Some(Ev::TranscribeUsage { speaker, input_tokens, output_tokens, seconds }) => {
                     if session.is_some() {
                         core.usage.record(Call {
@@ -175,6 +194,8 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
     };
     let (them_wav, me_wav) = (wav("them.wav"), if core.cfg.transcribe.capture_mic { wav("me.wav") } else { None });
     core.usage.begin(rec.as_ref().map(|r| r.dir()));
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    core.usage.event("session_start", serde_json::json!({ "unix": unix, "topic": topic, "version": env!("CARGO_PKG_VERSION") }));
     *core.rec.lock().unwrap() = rec;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -209,7 +230,7 @@ fn start_monitor(core: &Arc<Core>) -> Session {
         .map(|source| {
             let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
             let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
-            spawn_capture(&core.shared, source, threshold, &stop, tx, None);
+            spawn_capture(&core.shared, source, threshold, &stop, tx, None, None);
             tokio::spawn(async move { while rx.recv().await.is_some() {} })
         })
         .collect();
@@ -229,20 +250,40 @@ fn stop_monitor(monitor: &mut Option<Session>, core: &Arc<Core>) {
 /// Audio capture runs on its own thread (blocking pulse API). If the device goes away
 /// (e.g. headphones switched), keep retrying; the default device is re-read on each attempt.
 /// Silence is dropped before the frames are sent to `audio_tx`; `wav` gets the raw audio before the gate.
-pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::Threshold, stop: &Arc<AtomicBool>, audio_tx: UnboundedSender<Vec<u8>>, mut wav: Option<WavWriter>) {
+pub fn spawn_capture(
+    shared: &Shared,
+    source: audio::Source,
+    threshold: audio::Threshold,
+    stop: &Arc<AtomicBool>,
+    audio_tx: UnboundedSender<Vec<u8>>,
+    mut wav: Option<WavWriter>,
+    events: Option<UnboundedSender<Ev>>,
+) {
     let lost = match source {
         audio::Source::Speakers => "Audio device lost",
         audio::Source::Mic => "Microphone lost",
     };
     let (stop2, shared2) = (stop.clone(), shared.clone());
     let idx = meter_idx(source);
+    let speaker = if source == audio::Source::Mic { Speaker::Me } else { Speaker::Them };
     std::thread::spawn(move || {
         let mut gate = audio::SilenceGate::new(threshold);
         let mut recovering = false;
+        // The audio device is gone since then; only the first failure of an outage is reported.
+        let mut lost_at: Option<Instant> = None;
+        let send = |kind: &'static str, text: String, fields: serde_json::Value| {
+            if let Some(tx) = &events {
+                let _ = tx.send(note(speaker, "AUDIO", kind, text, fields));
+            }
+        };
         while !stop2.load(Ordering::Relaxed) {
             let res = audio::capture(source, &stop2, |c| {
                 if recovering {
                     recovering = false;
+                    if let Some(t) = lost_at.take() {
+                        let off = t.elapsed();
+                        send("audio_recovered", format!("{} recovered after {:.1} s", lost.to_lowercase(), off.as_secs_f64()), serde_json::json!({ "offline_ms": off.as_millis() as u64 }));
+                    }
                     shared2.update(|s| {
                         if s.status.starts_with(lost) {
                             s.status = "Listening".into();
@@ -264,6 +305,10 @@ pub fn spawn_capture(shared: &Shared, source: audio::Source, threshold: audio::T
                         break;
                     }
                     recovering = true;
+                    if lost_at.is_none() {
+                        lost_at = Some(Instant::now());
+                        send("audio_lost", format!("{} ({e})", lost.to_lowercase()), serde_json::json!({ "reason": e.to_string() }));
+                    }
                     shared2.update(|s| s.status = format!("{lost}, retrying… ({e})"));
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
@@ -284,7 +329,7 @@ fn spawn_stream(
 ) -> JoinHandle<()> {
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
     let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
-    spawn_capture(&core.shared, source, threshold, stop, audio_tx, wav);
+    spawn_capture(&core.shared, source, threshold, stop, audio_tx, wav, Some(ev_tx.clone()));
 
     let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());
     tokio::spawn(async move {
@@ -333,7 +378,7 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
     });
 }
 
-fn on_completed(core: &Arc<Core>, item_id: &str) {
+fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
     let found = core.shared.read(|s| {
         let idx = s.segments.iter().position(|x| x.item_id == item_id)?;
         let ctx: Vec<String> = s.segments[..idx].iter().rev().filter(|x| !x.partial).take(2).map(|x| x.es.clone()).collect();
@@ -342,7 +387,7 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
     let Some((speaker, es, ctx)) = found else { return };
     let rec = core.rec();
     if let Some(r) = &rec {
-        r.utterance(item_id, speaker, &es);
+        r.utterance(item_id, speaker, &es, stt);
     }
 
     // The user spoke: no translation needed, and a hint prepared before their answer is stale.
@@ -363,12 +408,26 @@ fn on_completed(core: &Arc<Core>, item_id: &str) {
     let (core2, id) = (core.clone(), item_id.to_string());
     let es2 = es.clone();
     tokio::spawn(async move {
-        let en = match core2.llm.translate(&core2.cfg.llm.translate_model, &ctx, &es2).await {
+        let started = Instant::now();
+        let res = core2.llm.translate(&core2.cfg.llm.translate_model, &ctx, &es2).await;
+        let took = started.elapsed();
+        core2.usage.event(
+            "translate",
+            serde_json::json!({
+                "id": id,
+                "model": core2.cfg.llm.translate_model,
+                "ms": took.as_millis() as u64,
+                "chars_in": es2.chars().count(),
+                "chars_out": res.as_ref().map_or(0, |t| t.chars().count()),
+                "ok": res.is_ok(),
+            }),
+        );
+        let en = match res {
             Ok(t) => t,
             Err(e) => format!("[translation error: {e}]"),
         };
         if let Some(r) = &rec {
-            r.translation(&id, &en);
+            r.translation(&id, &en, took);
         }
         core2.shared.update(|s| {
             if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == id) {

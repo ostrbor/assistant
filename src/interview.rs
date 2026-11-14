@@ -167,7 +167,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     let shared = Shared::new(None);
     let stop = Arc::new(AtomicBool::new(false));
     let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
-    core::spawn_capture(&shared, audio::Source::Speakers, audio::threshold(cfg.transcribe.silence_threshold), &stop, audio_tx, None);
+    core::spawn_capture(&shared, audio::Source::Speakers, audio::threshold(cfg.transcribe.silence_threshold), &stop, audio_tx, None, None);
     let (ev_tx, _ev_rx) = unbounded_channel();
     let transcribe = {
         let (tcfg, shared, key) = (cfg.transcribe.clone(), shared.clone(), key.clone());
@@ -187,7 +187,7 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
                 bail!("transcription stopped (check OPENAI_API_KEY and access to the Realtime API)");
             }
             let messages = build_messages(&persona, &docs_text, &history, turn, n);
-            let reply = clean_reply(&llm.hedged_stream(&cfg.llm.hint_models, messages, |_| {}).await?);
+            let reply = clean_reply(&llm.hedged_stream(&cfg.llm.hint_models, messages, |_| {}).await?.text);
             anyhow::ensure!(!reply.is_empty(), "the model returned an empty reply");
             say(&http, &key, icfg, &reply).await?;
             history.push(format!("Interviewer: {reply}"));

@@ -1,11 +1,12 @@
 use crate::config::Transcribe;
-use crate::core::Ev;
+use crate::core::{Ev, note};
+use crate::record::SttTiming;
 use crate::state::{Segment, Shared, Speaker};
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use futures::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, sleep, timeout};
@@ -75,9 +76,11 @@ pub async fn run_with_reconnect(
     let conn = Conn { cfg, url, key, shared: &shared, ev_tx: &ev_tx, speaker };
     let mut backlog: VecDeque<Vec<u8>> = VecDeque::new();
     let mut attempt = 0u32;
+    // Since when the connection is down (the first failure of the current outage).
+    let mut lost_at: Option<Instant> = None;
     loop {
         let mut up_since = None;
-        let res = run(&conn, &mut audio_rx, &mut backlog, &mut up_since).await;
+        let res = run(&conn, &mut audio_rx, &mut backlog, &mut up_since, lost_at).await;
         shared.update(|s| s.meters[speaker.idx()].connected = false);
         // Whatever was half-transcribed is final now: translate it and detect questions.
         finalize_partials(&shared, &ev_tx, speaker);
@@ -92,9 +95,20 @@ pub async fn run_with_reconnect(
         if up_since.is_some_and(|t: Instant| t.elapsed() > STABLE_AFTER) {
             attempt = 0;
         }
+        // A connection that was up and dropped starts a new outage; failed retries continue the old one.
+        if up_since.is_some() || lost_at.is_none() {
+            lost_at = Some(Instant::now());
+        }
         attempt += 1;
         let wait = backoff(attempt);
         eprintln!("realtime[{speaker:?}]: connection lost, attempt {attempt}, retry in {}s: {e:#}", wait.as_secs());
+        let _ = ev_tx.send(note(
+            speaker,
+            "CONN",
+            "conn_lost",
+            format!("connection lost: {e:#} (attempt {attempt}, retry in {} s)", wait.as_secs()),
+            json!({ "reason": format!("{e:#}"), "attempt": attempt, "retry_in_ms": wait.as_millis() as u64 }),
+        ));
         shared.update(|s| {
             s.status = format!("Reconnecting in {}s (attempt {attempt})…", wait.as_secs());
             s.conn_error = Some(format!("Connection lost: {e}"));
@@ -129,7 +143,7 @@ fn finalize_partials(shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spea
         s.segments.retain(|x| x.speaker != speaker || !x.es.trim().is_empty());
     });
     for id in ids {
-        let _ = ev_tx.send(Ev::Completed(id));
+        let _ = ev_tx.send(Ev::Completed { id, stt: None });
     }
 }
 
@@ -157,6 +171,7 @@ async fn run(
     audio_rx: &mut UnboundedReceiver<Vec<u8>>,
     backlog: &mut VecDeque<Vec<u8>>,
     up_since: &mut Option<Instant>,
+    lost_at: Option<Instant>,
 ) -> Result<()> {
     let Conn { cfg, url, key, shared, ev_tx, speaker } = *conn;
     let mut req = url.into_client_request()?;
@@ -181,6 +196,13 @@ async fn run(
     });
     send(&mut w, Message::Text(session.to_string())).await?;
     *up_since = Some(Instant::now());
+    let _ = ev_tx.send(match lost_at {
+        Some(t) => {
+            let off = t.elapsed();
+            note(speaker, "CONN", "conn_reconnected", format!("reconnected after {:.1} s offline", off.as_secs_f64()), json!({ "offline_ms": off.as_millis() as u64 }))
+        }
+        None => note(speaker, "CONN", "conn_up", "connected".to_string(), json!({})),
+    });
     shared.update(|s| {
         s.status = "Listening".into();
         s.conn_error = None;
@@ -201,6 +223,7 @@ async fn run(
     // The server accepted the session config (or sent transcripts) on this connection.
     let mut accepted = false;
     let mut last_error: Option<String> = None;
+    let mut speeches: HashMap<String, Speech> = HashMap::new();
     loop {
         tokio::select! {
             chunk = audio_rx.recv() => {
@@ -218,11 +241,12 @@ async fn run(
                 last_rx = Instant::now();
                 shared.update(|s| s.meters[speaker.idx()].last_server_msg = Some(last_rx));
                 match msg {
-                    Some(Ok(Message::Text(t))) => match handle(&t, shared, ev_tx, speaker)? {
+                    Some(Ok(Message::Text(t))) => match handle(&t, shared, ev_tx, speaker, &mut speeches)? {
                         Handled::Accepted => accepted = true,
                         Handled::Other => {}
                         Handled::ServerError { kind, message } => {
                             eprintln!("realtime[{speaker:?}]: server error: {t}");
+                            let _ = ev_tx.send(note(speaker, "CONN", "server_error", format!("server error: {message}"), json!({ "kind": kind, "message": message })));
                             let msg = format!("OpenAI: {message}");
                             // A config rejected before anything worked cannot be fixed by reconnecting.
                             if kind == "invalid_request_error" && !accepted {
@@ -263,7 +287,23 @@ enum Handled {
     Other,
 }
 
-fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker) -> Result<Handled> {
+/// What the voice detector reported about one utterance, to time the transcription.
+#[derive(Default)]
+struct Speech {
+    started_ms: Option<u64>,
+    stopped_ms: Option<u64>,
+    /// When the end of the speech reached us.
+    stopped_at: Option<Instant>,
+    got_text: bool,
+}
+
+impl Speech {
+    fn since_stop_ms(&self) -> Option<u64> {
+        self.stopped_at.map(|t| t.elapsed().as_millis() as u64)
+    }
+}
+
+fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker, speeches: &mut HashMap<String, Speech>) -> Result<Handled> {
     let v: Value = serde_json::from_str(text)?;
     let item_id = format!("{}{}", speaker.id_prefix(), v["item_id"].as_str().unwrap_or_default());
     let ty = v["type"].as_str().unwrap_or_default();
@@ -272,8 +312,30 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
     } else {
         Handled::Other
     };
+    let timing = |kind: &'static str, fields: Value| {
+        let _ = ev_tx.send(note(speaker, "STT", kind, String::new(), fields));
+    };
     match ty {
+        "input_audio_buffer.speech_started" => {
+            let ms = v["audio_start_ms"].as_u64();
+            speeches.entry(item_id.clone()).or_default().started_ms = ms;
+            timing("speech_started", json!({ "id": item_id, "audio_start_ms": ms }));
+        }
+        "input_audio_buffer.speech_stopped" => {
+            let ms = v["audio_end_ms"].as_u64();
+            let sp = speeches.entry(item_id.clone()).or_default();
+            (sp.stopped_ms, sp.stopped_at) = (ms, Some(Instant::now()));
+            timing("speech_stopped", json!({ "id": item_id, "audio_end_ms": ms, "speech_ms": sp.started_ms.zip(ms).map(|(a, b)| b.saturating_sub(a)) }));
+        }
+        "input_audio_buffer.committed" => {
+            let since = speeches.get(&item_id).and_then(Speech::since_stop_ms);
+            timing("committed", json!({ "id": item_id, "since_stop_ms": since }));
+        }
         "conversation.item.input_audio_transcription.delta" => {
+            let sp = speeches.entry(item_id.clone()).or_default();
+            if !std::mem::replace(&mut sp.got_text, true) {
+                timing("first_delta", json!({ "id": item_id, "since_stop_ms": sp.since_stop_ms() }));
+            }
             let delta = v["delta"].as_str().unwrap_or_default().to_string();
             shared.update(|s| {
                 if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == item_id) {
@@ -285,6 +347,20 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
         }
         "conversation.item.input_audio_transcription.completed" => {
             let full = v["transcript"].as_str().unwrap_or_default().trim().to_string();
+            let sp = speeches.remove(&item_id).unwrap_or_default();
+            let stt = SttTiming {
+                speech_secs: sp.started_ms.zip(sp.stopped_ms).map(|(a, b)| b.saturating_sub(a) as f64 / 1000.0),
+                stt_secs: sp.stopped_at.map(|t| t.elapsed().as_secs_f64()),
+            };
+            timing(
+                "stt_completed",
+                json!({
+                    "id": item_id,
+                    "speech_ms": stt.speech_secs.map(|s| (s * 1000.0).round() as u64),
+                    "stt_ms": stt.stt_secs.map(|s| (s * 1000.0).round() as u64),
+                    "chars": full.chars().count(),
+                }),
+            );
             shared.update(|s| {
                 if full.is_empty() {
                     s.segments.retain(|x| x.item_id != item_id);
@@ -299,7 +375,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
                 let _ = ev_tx.send(Ev::TranscribeUsage { speaker, input_tokens, output_tokens, seconds });
             }
             if !full.is_empty() {
-                let _ = ev_tx.send(Ev::Completed(item_id));
+                let _ = ev_tx.send(Ev::Completed { id: item_id, stt: Some(stt) });
             }
         }
         // Not fatal: show it and keep going. A truly fatal condition is followed by a close,
@@ -461,14 +537,20 @@ mod tests {
         });
 
         let mut completed = Vec::new();
+        let mut notes: Vec<(&str, String)> = Vec::new();
         while completed.len() < 2 {
             let ev = timeout(Duration::from_secs(10), ev_rx.recv()).await.expect("timed out").expect("channel closed");
-            if let Ev::Completed(id) = ev {
-                completed.push(id);
+            match ev {
+                Ev::Completed { id, .. } => completed.push(id),
+                Ev::Note { kind, text, .. } if kind.starts_with("conn_") => notes.push((kind, text)),
+                _ => {}
             }
         }
         assert_eq!(completed, ["them:a", "them:b"]); // "a" finalized from a partial after the drop
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+        let kinds: Vec<&str> = notes.iter().map(|n| n.0).collect();
+        assert_eq!(kinds, ["conn_up", "conn_lost", "conn_reconnected"], "{notes:?}");
+        assert!(notes[1].1.contains("attempt 1") && notes[2].1.contains("s offline"), "{notes:?}");
         let segs = shared.read(|s| s.segments.iter().map(|x| (x.item_id.clone(), x.es.clone(), x.partial)).collect::<Vec<_>>());
         assert_eq!(segs, [("them:a".into(), "Hola".into(), false), ("them:b".into(), "Buenos dias".into(), false)]);
         assert!(seen.lock().unwrap().iter().any(|s| s.starts_with("Reconnecting")), "statuses: {:?}", seen.lock().unwrap());

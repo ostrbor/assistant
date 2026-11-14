@@ -43,6 +43,14 @@ On the first start the app creates `~/assistant/` with a default `config.toml` a
 
 **Session records.** Every Listen → Stop creates `~/assistant/sessions/<date_time>/` with `session.log` (transcript, translations, hints with their sources, errors; times are offsets from the start) and the raw audio `them.wav` (speakers) and `me.wav` (microphone, recorded before the silence filter). They are for debugging and are never deleted automatically (about 170 MB per hour per file).
 
+**Timings and service events.** `session.log` starts with the wall-clock start time; every line carries the offset from it. Utterances show how long the speech was and how long it took to become text (`(speech 2.8 s, stt +0.6 s)`), translations show their delay (`EN (+0.9 s)`), hints show the model that won, the document search time, the time to the first token and the total. Service events are logged too: `CONN THEM: connection lost … (attempt 1, retry in 1 s)`, `reconnected after 1.4 s offline`, server errors, `AUDIO …` device losses.
+
+For comparing recordings, `events.jsonl` in the same folder has one JSON object per event with `t` (seconds from the session start) and `ev`. Stages: `speech_started` / `speech_stopped` / `committed` / `first_delta` / `stt_completed` (`stt_ms` = end of speech → final text), `translate` (`ms`), `hint_start` / `hint_search` / `hint_model` (one per model in the race: `first_token_ms`, `total_ms`, `outcome`) / `hint_done` / `hint_shown`, and `conn_up` / `conn_lost` / `conn_reconnected` / `server_error` / `audio_lost` / `audio_recovered`. Median speech-to-text delay over several sessions:
+
+```
+cat sessions/*/events.jsonl | jq -s '[.[] | select(.ev=="stt_completed" and .stt_ms) | .stt_ms] | sort | .[length/2|floor]'
+```
+
 **Session cost.** After Stop a *Session cost* window shows the approximate total (`≈ $0.0123`). The breakdown is only in the session folder: `cost.txt` (per model: calls, tokens in/out, busy time, price; covers transcription, translation and hints, including the hedged hint requests that lost the race) and `usage.csv` (one row per request, written as it happens). The figures are approximate: prices are built-in list prices, override or add models in `[prices."<model>"]` of `config.toml`; token counts the provider did not report are estimated and marked `~`. The provider's dashboard is authoritative.
 
 **Logs.** When started from the menu (no terminal), warnings and errors are written to `~/assistant/assistant.log` (rotated to `assistant.log.old` at about 1 MB). When started from a terminal, they are printed there instead.

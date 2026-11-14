@@ -55,7 +55,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Outcome::Won => "won",
             Outcome::Lost => "lost",
@@ -146,6 +146,8 @@ struct Inner {
     start: Instant,
     calls: Vec<(Duration, Call)>,
     csv: Option<BufWriter<File>>,
+    /// `events.jsonl`: one JSON object per timing/service event of the session.
+    events: Option<BufWriter<File>>,
 }
 
 pub struct UsageMeter {
@@ -155,7 +157,7 @@ pub struct UsageMeter {
 
 impl UsageMeter {
     pub fn new(prices: Prices) -> Self {
-        Self { prices, inner: Mutex::new(Inner { start: Instant::now(), calls: Vec::new(), csv: None }) }
+        Self { prices, inner: Mutex::new(Inner { start: Instant::now(), calls: Vec::new(), csv: None, events: None }) }
     }
 
     /// Starts a session: clears the records and opens `<dir>/usage.csv`. A failure to open the
@@ -165,10 +167,27 @@ impl UsageMeter {
         g.start = Instant::now();
         g.calls.clear();
         g.csv = dir.and_then(|d| File::create(d.join("usage.csv")).ok()).map(BufWriter::new);
+        g.events = dir.and_then(|d| File::create(d.join("events.jsonl")).ok()).map(BufWriter::new);
         if let Some(w) = &mut g.csv {
             let _ = writeln!(w, "t_sec,purpose,model,input_tokens,output_tokens,audio_sec,duration_sec,outcome,estimated,cost_usd");
             let _ = w.flush();
         }
+    }
+
+    /// Appends `{"t": seconds since the session start, "ev": name, ...fields}` to `events.jsonl`.
+    /// Does nothing outside a recorded session.
+    pub fn event(&self, ev: &str, fields: Value) {
+        let mut g = self.inner.lock().unwrap();
+        let t = (g.start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+        let Some(w) = &mut g.events else { return };
+        let mut obj = serde_json::Map::new();
+        obj.insert("t".into(), t.into());
+        obj.insert("ev".into(), ev.into());
+        if let Value::Object(f) = fields {
+            obj.extend(f);
+        }
+        let _ = writeln!(w, "{}", Value::Object(obj));
+        let _ = w.flush();
     }
 
     pub fn record(&self, call: Call) {
@@ -397,6 +416,24 @@ mod tests {
         m.record(call(Purpose::Translate, "openai/gpt-oss-20b:groq", 100, 20, Outcome::Won));
         let text = std::fs::read_to_string(d.join("usage.csv")).unwrap();
         assert!(text.starts_with("t_sec,purpose") && text.contains(",translate,openai/gpt-oss-20b:groq,100,20,"), "{text}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn events_are_json_lines_with_time_and_name() {
+        let d = std::env::temp_dir().join(format!("assistant-test-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let m = UsageMeter::new(Prices::new(&HashMap::new()));
+        m.event("ignored", serde_json::json!({}));
+        m.begin(Some(&d));
+        m.event("translate", serde_json::json!({ "id": "them:1", "ms": 420 }));
+        m.event("conn_lost", serde_json::json!({}));
+        let text = std::fs::read_to_string(d.join("events.jsonl")).unwrap();
+        let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(rows[0]["t"].is_number() && rows[0]["ev"] == "translate" && rows[0]["ms"] == 420 && rows[0]["id"] == "them:1");
+        assert_eq!(rows[1]["ev"], "conn_lost");
         let _ = std::fs::remove_dir_all(d);
     }
 }

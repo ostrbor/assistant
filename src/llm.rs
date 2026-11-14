@@ -27,6 +27,12 @@ pub struct Llm {
     usage: Arc<UsageMeter>,
 }
 
+/// The finished answer of a hedged request and the model that produced it.
+pub struct Streamed {
+    pub text: String,
+    pub model: String,
+}
+
 enum StreamEv {
     Delta(String),
     Done,
@@ -107,7 +113,7 @@ impl Llm {
 
     /// Streams a hint from several models/providers at once and keeps whichever starts answering
     /// first. Every request, the losing ones too, is recorded in the usage meter.
-    pub async fn hedged_stream(&self, models: &[String], messages: Value, mut on_update: impl FnMut(&str)) -> Result<String> {
+    pub async fn hedged_stream(&self, models: &[String], messages: Value, mut on_update: impl FnMut(&str)) -> Result<Streamed> {
         let key = self.key()?;
         let (tx, mut rx) = mpsc::unbounded_channel::<(usize, StreamEv)>();
         let winner_idx = Arc::new(AtomicUsize::new(NO_WINNER));
@@ -124,6 +130,7 @@ impl Llm {
                     idx: i,
                     winner: winner_idx.clone(),
                     started: Instant::now(),
+                    first_token: None,
                     input_chars,
                     out_chars: 0,
                     tokens: None,
@@ -160,7 +167,7 @@ impl Llm {
                         on_update(&text);
                     }
                 }
-                StreamEv::Done if winner == Some(i) => break Ok(text.clone()),
+                StreamEv::Done if winner == Some(i) => break Ok(Streamed { text: text.clone(), model: models[i].clone() }),
                 StreamEv::Done => {}
                 StreamEv::Err(e) => {
                     if winner == Some(i) {
@@ -188,6 +195,8 @@ struct StreamGuard {
     idx: usize,
     winner: Arc<AtomicUsize>,
     started: Instant,
+    /// Time from the request to the first token.
+    first_token: Option<Duration>,
     input_chars: usize,
     out_chars: usize,
     /// Reported by the provider in the final chunk.
@@ -215,6 +224,17 @@ impl Drop for StreamGuard {
             (None, Outcome::Error) => ((0, 0), false),
             (None, _) => ((usage::estimate_tokens(self.input_chars), usage::estimate_tokens(self.out_chars)), true),
         };
+        // Every request of the race, with how fast it started answering.
+        self.usage.event(
+            "hint_model",
+            json!({
+                "model": self.model,
+                "outcome": outcome.label(),
+                "first_token_ms": self.first_token.map(|d| d.as_millis() as u64),
+                "total_ms": self.started.elapsed().as_millis() as u64,
+                "out_chars": self.out_chars,
+            }),
+        );
         self.usage.record(Call {
             purpose: Purpose::Hint,
             model: std::mem::take(&mut self.model),
@@ -264,6 +284,7 @@ async fn stream_one(
             if let Some(d) = v["choices"][0]["delta"]["content"].as_str()
                 && !d.is_empty()
             {
+                guard.first_token.get_or_insert_with(|| guard.started.elapsed());
                 guard.out_chars += d.len();
                 let _ = tx.send((idx, StreamEv::Delta(d.to_string())));
             }
@@ -286,6 +307,7 @@ mod tests {
             idx,
             winner: Arc::new(AtomicUsize::new(winner)),
             started: Instant::now(),
+            first_token: None,
             input_chars: 400,
             out_chars: 40,
             tokens: None,
