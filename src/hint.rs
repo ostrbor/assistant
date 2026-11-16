@@ -16,8 +16,9 @@ For personal facts about the user that are not in the excerpts (employers, dates
 Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in Russian>\nES: <the answer in Spanish>\nRU: <Russian translation of the answer>";
 
 /// Added to the prompt of automatic hints, which fire after every turn of the other person.
-const AUTO_RULE: &str = "\nThis request is automatic, made after every turn of Them. If the last thing Them said contains no question or request addressed to the user \
-(small talk, thanks, an acknowledgement, they are still explaining), output exactly the single word NONE and nothing else.";
+const AUTO_RULE: &str = "\nThis request is automatic, made after every turn of Them. Look at the latest turn of Them: all 'Them:' lines after the last 'Me:' line. \
+If that turn contains a question or request addressed to the user that the user has not answered yet, answer it, even if Them added an explanation, example or comment after the question. \
+Output exactly the single word NONE and nothing else only when the whole turn has no such question (small talk, thanks, an acknowledgement, or they are still explaining before asking anything).";
 
 /// How a hint was started.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
