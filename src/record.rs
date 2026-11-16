@@ -1,6 +1,7 @@
 //! Per-session debug record: `sessions/<local time>/session.log` (transcript, translations,
 //! hints with sources, errors), raw audio (`them.wav`, `me.wav`) and the cost report
-//! (`usage.csv` per request, `cost.txt` summary).
+//! (`usage.csv` per request, `cost.txt` summary). In the debug mode `--record-video` the window is
+//! recorded too (`screen.mp4`, `screen_audio.mp4`, see `video.rs`).
 
 use crate::config::Config;
 use crate::state::{Hint, Speaker};

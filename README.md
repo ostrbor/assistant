@@ -98,6 +98,7 @@ Only text PDFs are supported (scanned images have no text to search). The extrac
 ```bash
 cargo run --release                          # pick the document folder in the window
 cargo run --release -- --topic project_x     # preselect a document folder
+cargo run --release -- --record-video        # debug: also record the window as a video
 ```
 
 | Control | Action |

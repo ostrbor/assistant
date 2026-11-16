@@ -203,6 +203,7 @@ fn start(core: &Arc<Core>, ev_tx: &UnboundedSender<Ev>) -> Result<Session> {
     core.usage.begin(rec.as_ref().map(|r| r.dir()));
     let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     core.usage.event("session_start", serde_json::json!({ "unix": unix, "topic": topic, "version": env!("CARGO_PKG_VERSION") }));
+    core.shared.update(|s| s.session_dir = rec.as_ref().map(|r| r.dir().to_path_buf()));
     *core.rec.lock().unwrap() = rec;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -383,6 +384,7 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
             s.cost_report = cost;
         }
         s.listening = false;
+        s.session_dir = None;
         s.listening_since = None;
         s.status = "Stopped".into();
         s.conn_error = None;

@@ -269,6 +269,8 @@ pub struct AppState {
     pub topics: Vec<String>,
     pub topic: Option<String>,
     pub topic_loading: bool,
+    /// Folder of the running session record (the debug video goes there).
+    pub session_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {

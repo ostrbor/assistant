@@ -22,10 +22,14 @@ pub struct App {
     show_me: bool,
     /// Show the Russian translations.
     show_ru: bool,
+    /// Debug: record the window into the session folder while listening.
+    record_video: bool,
+    video: Option<crate::video::VideoRecorder>,
+    last_shot: Instant,
 }
 
 impl App {
-    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration, storage: Option<&dyn eframe::Storage>) -> Self {
+    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration, storage: Option<&dyn eframe::Storage>, force_video: bool) -> Self {
         let get = |key: &str, default: bool| storage.and_then(|s| eframe::get_value(s, key)).unwrap_or(default);
         Self {
             shared,
@@ -38,11 +42,42 @@ impl App {
             pending_copy: false,
             show_me: get("show_me", false),
             show_ru: get("show_ru", true),
+            record_video: force_video || get("record_video", false),
+            video: None,
+            last_shot: Instant::now(),
         }
     }
 
     fn send(&self, c: Cmd) {
         let _ = self.cmd_tx.send(c);
+    }
+
+    /// Debug video: one recorder per listening session, fed with egui screenshots.
+    fn drive_video(&mut self, ctx: &egui::Context, listening: bool, session_dir: Option<std::path::PathBuf>) {
+        let want = self.record_video && listening;
+        if !want {
+            if let Some(v) = self.video.take() {
+                v.finish();
+            }
+            return;
+        }
+        if self.video.is_none() && let Some(dir) = session_dir {
+            let shared = self.shared.clone();
+            self.video = Some(crate::video::VideoRecorder::start(dir, move |e| shared.update(|s| s.error = Some(e))));
+        }
+        let Some(video) = &self.video else { return };
+        let shots: Vec<_> = ctx.input(|i| {
+            i.raw.events.iter().filter_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }).collect()
+        });
+        for s in shots {
+            video.push(s);
+        }
+        if self.last_shot.elapsed() >= crate::video::FRAME_EVERY {
+            self.last_shot = Instant::now();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        }
+        // Keep frames coming even when nothing changes on screen.
+        ctx.request_repaint_after(crate::video::FRAME_EVERY);
     }
 }
 
@@ -206,6 +241,7 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "show_me", &self.show_me);
         eframe::set_value(storage, "show_ru", &self.show_ru);
+        eframe::set_value(storage, "record_video", &self.record_video);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -231,8 +267,10 @@ impl eframe::App for App {
             monitoring,
             cost_report,
             cost_open,
+            session_dir,
             ..
         } = self.shared.read(AppState::clone);
+        self.drive_video(ctx, listening, session_dir);
 
         // Keys (window focused, no menu open): Space / H = hint, L = listen / stop.
         if !ctx.memory(|m| m.any_popup_open()) {
@@ -339,6 +377,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.checkbox(&mut self.show_me, "Show my speech");
                         ui.checkbox(&mut self.show_ru, "Russian translation");
+                        ui.checkbox(&mut self.record_video, "Record window video (debug)").on_hover_text("While listening, saves screen.mp4 and screen_audio.mp4 into the session folder");
                         ui.separator();
                         if ui.button("Clear dialog").clicked() {
                             self.to_bottom = true;
@@ -367,6 +406,9 @@ impl eframe::App for App {
                     });
                     if loading {
                         ui.spinner();
+                    }
+                    if self.video.is_some() {
+                        ui.label(RichText::new("REC video").small().color(Color32::LIGHT_RED));
                     }
                     if listening && status == "Listening" {
                         // The red bar already says "recording": only a dot and the timer.

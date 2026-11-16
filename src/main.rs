@@ -12,6 +12,7 @@ mod search;
 mod state;
 mod ui;
 mod usage;
+mod video;
 #[cfg(feature = "updater")]
 mod update;
 
@@ -88,6 +89,8 @@ fn main() -> Result<()> {
         Err(e) => (vec![], Some(e.to_string())),
     };
 
+    // `--record-video`: record the window into the session folder (debug).
+    let record_video = has("--record-video");
     let hint_max_age = std::time::Duration::from_secs(cfg.hint_max_age_secs);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = rt.handle().clone();
@@ -120,7 +123,7 @@ fn main() -> Result<()> {
                 let _ = cmd_tx.send(core::Cmd::SelectTopic(t));
             }
             handle.spawn(core::run(core, cmd_rx));
-            Ok(Box::new(ui::App::new(shared, cmd_tx, hint_max_age, cc.storage)))
+            Ok(Box::new(ui::App::new(shared, cmd_tx, hint_max_age, cc.storage, record_video)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))?;
