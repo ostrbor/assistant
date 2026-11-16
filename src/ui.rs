@@ -191,14 +191,25 @@ impl eframe::App for App {
         });
 
         let mut dismiss_error = false;
-        let mut top = egui::TopBottomPanel::top("top");
+        let mut top = egui::TopBottomPanel::bottom("controls");
         if listening {
             // Whole bar tinted red while recording (static: motion draws the eye).
             top = top.frame(egui::Frame::side_top_panel(&ctx.style()).fill(Color32::from_rgb(70, 20, 20)));
         }
         top.show(ctx, |ui| {
+            if let Some(e) = &conn_error {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            if let Some(e) = &error {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                    if ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                        dismiss_error = true;
+                    }
+                });
+            }
             ui.horizontal(|ui| {
-                let btn_size = egui::vec2(104.0, 30.0);
+                let btn_size = egui::vec2(88.0, 30.0);
                 let (icon, label, fill) = if listening {
                     (Icon::Square, "Stop", Color32::from_rgb(190, 40, 40))
                 } else {
@@ -214,18 +225,7 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     let menu = egui::menu::menu_custom_button(ui, egui::Button::new("").min_size(egui::vec2(30.0, 30.0)), |ui| {
                         ui.add_enabled_ui(!loading, |ui| {
-                            ui.menu_button(format!("Docs: {}", topic.as_deref().unwrap_or("— choose —")), |ui| {
-                                for t in &topics {
-                                    if ui.selectable_label(topic.as_deref() == Some(t.as_str()), t).clicked() {
-                                        self.send(Cmd::SelectTopic(t.clone()));
-                                        ui.close_menu();
-                                    }
-                                }
-                                if topics.is_empty() {
-                                    ui.weak("No folders in docs/");
-                                }
-                            });
-                            if ui.button("Rescan docs folder").clicked() {
+                            if ui.button("Rescan docs").clicked() {
                                 self.send(Cmd::RefreshTopics);
                                 ui.close_menu();
                             }
@@ -272,10 +272,10 @@ impl eframe::App for App {
                     for dy in [-5.0_f32, 0.0, 5.0] {
                         ui.painter().line_segment([egui::pos2(c.x - 7.0, c.y + dy), egui::pos2(c.x + 7.0, c.y + dy)], egui::Stroke::new(2.0_f32, color));
                     }
-                    if problems > 0 || topic.is_none() {
-                        let warn = if topic.is_none() { Color32::from_rgb(230, 170, 40) } else { docs_line.as_ref().map_or(Color32::LIGHT_RED, |d| d.0) };
+                    if problems > 0 {
+                        let warn = docs_line.as_ref().map_or(Color32::LIGHT_RED, |d| d.0);
                         ui.painter().circle_filled(egui::pos2(rect.right() - 5.0, rect.top() + 5.0), 4.0, warn);
-                        menu.response.on_hover_text(if topic.is_none() { "Choose a docs folder" } else { "Some documents have problems" });
+                        menu.response.on_hover_text("Some documents have problems");
                     }
                     let timer = since.map(|t| {
                         let s = t.elapsed().as_secs();
@@ -296,19 +296,31 @@ impl eframe::App for App {
                             None => status.clone(),
                         });
                     }
+                    // The docs folder the hints are generated from stays visible; it takes the leftover width.
+                    ui.add_enabled_ui(!loading, |ui| {
+                        let (text, color) = match &topic {
+                            Some(t) => (t.clone(), ui.visuals().text_color()),
+                            None => ("choose docs".to_owned(), Color32::from_rgb(230, 170, 40)),
+                        };
+                        let w = (ui.available_width() - 8.0).clamp(80.0, 240.0);
+                        egui::ComboBox::from_id_salt("topic")
+                            .width(w)
+                            .selected_text(RichText::new(text).color(color))
+                            .show_ui(ui, |ui| {
+                                for t in &topics {
+                                    if ui.selectable_label(topic.as_deref() == Some(t.as_str()), t).clicked() {
+                                        self.send(Cmd::SelectTopic(t.clone()));
+                                    }
+                                }
+                                if topics.is_empty() {
+                                    ui.weak("No folders in docs/");
+                                }
+                            })
+                            .response
+                            .on_hover_text("Documents folder used for hints");
+                    });
                 });
             });
-            if let Some(e) = &conn_error {
-                ui.colored_label(Color32::LIGHT_RED, e);
-            }
-            if let Some(e) = &error {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(Color32::LIGHT_RED, e);
-                    if ui.small_button("x").on_hover_text("Dismiss").clicked() {
-                        dismiss_error = true;
-                    }
-                });
-            }
         });
         if dismiss_error {
             self.shared.update(|s| s.error = None);
@@ -470,7 +482,7 @@ impl eframe::App for App {
             });
             let at_bottom = out.state.offset.y + out.inner_rect.height() >= out.content_size.y - 8.0;
             if !at_bottom {
-                egui::Area::new(egui::Id::new("latest")).anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -8.0]).show(ctx, |ui| {
+                egui::Area::new(egui::Id::new("latest")).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(out.inner_rect.right_bottom() + egui::vec2(-16.0, -8.0)).show(ctx, |ui| {
                     if ui.button("↓ Latest").clicked() {
                         self.to_bottom = true;
                     }
