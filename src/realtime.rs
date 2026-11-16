@@ -202,6 +202,24 @@ pub fn stt_prompt(language: &str, topic: Option<&str>, extra: &str) -> String {
     parts.join(" ")
 }
 
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+}
+
+/// Is this "phrase" not speech at all? On a sound without words the recognizer still has to return
+/// something: it either writes a symbol like `###` (no letters) or repeats the prompt it was given.
+/// Such a phrase is dropped. A text counts as an echo of the prompt when it is two or more words
+/// that stand together in the prompt (case and punctuation ignored), so a real one-word answer
+/// such as "Algebra" is kept.
+pub fn is_junk(text: &str, prompt: &str) -> bool {
+    let w = words(text);
+    if w.is_empty() {
+        return true;
+    }
+    let p = words(prompt);
+    w.len() >= 2 && p.windows(w.len()).any(|x| x == w.as_slice())
+}
+
 /// One connection. `up_since` is set once the session is established.
 async fn run(
     conn: &Conn<'_>,
@@ -467,6 +485,19 @@ mod tests {
         assert_eq!(stt_prompt("es", Some("  "), ""), "Conversación en español.");
         // No Spanish sentence for another language.
         assert_eq!(stt_prompt("en", Some("math"), ""), "Tema: math.");
+    }
+
+    #[test]
+    fn junk_is_symbols_or_an_echo_of_the_recognizer_prompt() {
+        let prompt = stt_prompt("es", Some("algebra"), "");
+        for junk in ["Conversación en español.", "Conversación en español. Tema: algebra.", "conversación en español", "Tema: algebra.", "###", "...", "-", " ", ""] {
+            assert!(is_junk(junk, &prompt), "{junk:?} must be dropped");
+        }
+        for speech in ["Sí.", "Ah,", "Hmm", "Y...", "Algebra", "Hola, buenas noches.", "¿Qué es una preimagen?", "Conversación en la clase."] {
+            assert!(!is_junk(speech, &prompt), "{speech:?} must be kept");
+        }
+        // Without a topic only the language sentence is the prompt.
+        assert!(!is_junk("Tema: algebra.", &stt_prompt("es", None, "")));
     }
 
     fn test_cfg() -> Transcribe {

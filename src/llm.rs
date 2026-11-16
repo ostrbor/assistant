@@ -13,12 +13,28 @@ use tokio::time::timeout;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Whole non-streaming request (translation).
 const TRANSLATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pauses before the 1st and 2nd retry of a translation.
+const RETRY_PAUSES: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
 /// No model has produced a first token within this time.
 const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// The winning stream went quiet for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// `winner` value while no stream has started answering.
 const NO_WINNER: usize = usize::MAX;
+
+/// A rate limit or a server-side failure may pass in a moment; a client error will not.
+fn is_retryable(status: u16) -> bool {
+    status == 429 || status >= 500
+}
+
+/// What the translator is told. The topic keeps terms right ("preimagen" is "прообраз" in algebra).
+pub fn translate_prompt(topic: Option<&str>) -> String {
+    let mut p = String::from("Translate the Spanish utterance from a video call into natural Russian. Output only the translation of the last utterance, nothing else.");
+    if let Some(t) = topic.map(str::trim).filter(|t| !t.is_empty()) {
+        p.push_str(&format!(" Topic of the call: {t}. Use the standard Russian terminology of this field."));
+    }
+    p
+}
 
 pub struct Llm {
     http: reqwest::Client,
@@ -66,7 +82,10 @@ impl Llm {
         b
     }
 
-    pub async fn translate(&self, model: &str, context: &[String], es: &str) -> Result<String> {
+    /// Translates one utterance. A rate limit (429), a server error (5xx) or a network failure is
+    /// retried after the pauses in `RETRY_PAUSES`; anything else (bad key, bad request) is not.
+    /// Returns the text and how many retries it took.
+    pub async fn translate(&self, model: &str, topic: Option<&str>, context: &[String], es: &str) -> Result<(String, usize)> {
         let key = self.key()?;
         let mut user = String::new();
         if !context.is_empty() {
@@ -77,11 +96,22 @@ impl Llm {
         }
         user.push_str(&format!("Utterance to translate:\n{es}"));
         let messages = json!([
-            { "role": "system", "content": "Translate the Spanish utterance from a video call into natural Russian. Output only the translation of the last utterance, nothing else." },
+            { "role": "system", "content": translate_prompt(topic) },
             { "role": "user", "content": user }
         ]);
         let started = Instant::now();
-        let out = self.translate_request(key, model, &messages).await;
+        let mut retries = 0;
+        let out = loop {
+            match self.translate_request(key, model, &messages).await {
+                Err((_, true)) if retries < RETRY_PAUSES.len() => {
+                    tokio::time::sleep(RETRY_PAUSES[retries]).await;
+                    retries += 1;
+                }
+                Err((e, _)) if retries > 0 => break Err(anyhow!("{e} (after {} attempts)", retries + 1)),
+                Err((e, _)) => break Err(e),
+                Ok(v) => break Ok(v),
+            }
+        };
         let (outcome, tokens, estimated) = match &out {
             Ok((_, Some(t))) => (Outcome::Won, *t, false),
             Ok((text, None)) => (Outcome::Won, (usage::estimate_tokens(messages.to_string().len()), usage::estimate_tokens(text.len())), true),
@@ -98,15 +128,24 @@ impl Llm {
             outcome,
             estimated,
         });
-        out.map(|(text, _)| text)
+        out.map(|(text, _)| (text, retries))
     }
 
-    async fn translate_request(&self, key: &str, model: &str, messages: &Value) -> Result<(String, Option<(u64, u64)>)> {
-        let res = self.http.post(&self.url).bearer_auth(key).timeout(TRANSLATE_TIMEOUT).json(&Self::body(model, messages, false, 600)).send().await?;
+    /// The error comes with a flag: is it worth trying again.
+    async fn translate_request(&self, key: &str, model: &str, messages: &Value) -> std::result::Result<(String, Option<(u64, u64)>), (anyhow::Error, bool)> {
+        let res = self
+            .http
+            .post(&self.url)
+            .bearer_auth(key)
+            .timeout(TRANSLATE_TIMEOUT)
+            .json(&Self::body(model, messages, false, 600))
+            .send()
+            .await
+            .map_err(|e| (anyhow::Error::from(e), true))?;
         let status = res.status();
-        let v: Value = res.json().await?;
+        let v: Value = res.json().await.map_err(|e| (anyhow::Error::from(e), true))?;
         if !status.is_success() {
-            bail!("LLM {status}: {}", v["error"]["message"].as_str().unwrap_or("error"));
+            return Err((anyhow!("LLM {status}: {}", v["error"]["message"].as_str().unwrap_or("error")), is_retryable(status.as_u16())));
         }
         let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
         Ok((text, usage::parse_chat_usage(&v)))
@@ -309,6 +348,23 @@ async fn stream_one(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_rate_limits_and_server_errors_are_retried() {
+        for s in [429, 500, 502, 503] {
+            assert!(super::is_retryable(s), "{s}");
+        }
+        for s in [400, 401, 403, 404] {
+            assert!(!super::is_retryable(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn translator_is_told_the_topic() {
+        assert!(!super::translate_prompt(None).contains("Topic"));
+        assert!(!super::translate_prompt(Some("  ")).contains("Topic"));
+        assert!(super::translate_prompt(Some("algebra")).contains("Topic of the call: algebra."));
+    }
+
     use super::*;
     use crate::usage::Prices;
 

@@ -43,7 +43,7 @@ base_url = "https://router.huggingface.co/v1"
 # Hugging Face token (or the key of the endpoint above); if empty, the environment variable below is used
 api_key = ""
 api_key_env = "HF_TOKEN"
-translate_model = "openai/gpt-oss-20b:groq"
+translate_model = "Qwen/Qwen3-235B-A22B-Instruct-2507:parasail"
 # Hints go to all listed models in parallel; the first to answer wins (hedging)
 hint_models = ["openai/gpt-oss-120b:cerebras", "openai/gpt-oss-120b:groq"]
 

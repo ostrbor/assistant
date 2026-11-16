@@ -413,6 +413,27 @@ fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
     });
     let Some((speaker, es, ctx)) = found else { return };
     let rec = core.rec();
+
+    // A sound without words: the recognizer returned a symbol or echoed its own prompt. It is not
+    // shown, not translated and does not start a hint.
+    let topic = core.shared.read(|s| s.topic.clone());
+    let prompt = realtime::stt_prompt(&core.cfg.transcribe.language, topic.as_deref(), &core.cfg.transcribe.prompt);
+    if realtime::is_junk(&es, &prompt) {
+        core.shared.update(|s| {
+            s.segments.retain(|x| x.item_id != item_id);
+            // "They are speaking" was set by the sound that turned out to be nothing.
+            if speaker == Speaker::Them && s.hint_status == HintStatus::Listening {
+                s.hint_status = HintStatus::Idle;
+            }
+        });
+        let who = if speaker == Speaker::Me { "ME" } else { "THEM" };
+        core.usage.event("dropped", serde_json::json!({ "id": item_id, "speaker": who, "text": es }));
+        if let Some(r) = &rec {
+            r.note(&format!("DROPPED {who}: {}", es.trim()));
+        }
+        return;
+    }
+
     if let Some(r) = &rec {
         r.utterance(item_id, speaker, &es, stt);
     }
@@ -427,7 +448,7 @@ fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
     let es2 = es.clone();
     tokio::spawn(async move {
         let started = Instant::now();
-        let res = core2.llm.translate(&core2.cfg.llm.translate_model, &ctx, &es2).await;
+        let res = core2.llm.translate(&core2.cfg.llm.translate_model, topic.as_deref(), &ctx, &es2).await;
         let took = started.elapsed();
         core2.usage.event(
             "translate",
@@ -436,16 +457,17 @@ fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
                 "model": core2.cfg.llm.translate_model,
                 "ms": took.as_millis() as u64,
                 "chars_in": es2.chars().count(),
-                "chars_out": res.as_ref().map_or(0, |t| t.chars().count()),
+                "chars_out": res.as_ref().map_or(0, |t| t.0.chars().count()),
                 "ok": res.is_ok(),
+                "retries": res.as_ref().map_or(0, |(_, n)| *n),
             }),
         );
-        let ru = match res {
-            Ok(t) => t,
-            Err(e) => format!("[translation error: {e}]"),
+        let (ru, retries) = match res {
+            Ok((t, n)) => (t, n),
+            Err(e) => (format!("[translation error: {e}]"), 0),
         };
         if let Some(r) = &rec {
-            r.translation(&id, &ru, took);
+            r.translation(&id, &ru, took, retries);
         }
         core2.shared.update(|s| {
             if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == id) {

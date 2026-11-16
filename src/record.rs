@@ -121,8 +121,9 @@ impl SessionLog {
         self.write(&format!("#{} {who}{timing}: {}", self.number(item_id), es.trim()));
     }
 
-    pub fn translation(&self, item_id: &str, ru: &str, took: Duration) {
-        self.write(&format!("#{} RU (+{:.1} s): {}", self.number(item_id), took.as_secs_f64(), ru.trim()));
+    pub fn translation(&self, item_id: &str, ru: &str, took: Duration, retries: usize) {
+        let retry = if retries > 0 { format!(", {retries} retr{}", if retries == 1 { "y" } else { "ies" }) } else { String::new() };
+        self.write(&format!("#{} RU (+{:.1} s{retry}): {}", self.number(item_id), took.as_secs_f64(), ru.trim()));
     }
 
     pub fn hint(&self, h: &Hint, mode: crate::hint::Mode, t: &HintTiming) {
@@ -248,7 +249,8 @@ mod tests {
         let cfg: Config = toml::from_str(&std::fs::read_to_string("config.toml").unwrap()).unwrap();
         let log = SessionLog::create(&d, &cfg, Some("topic")).unwrap();
         log.utterance("them:1", Speaker::Them, "¿Cuántos años?", Some(SttTiming { speech_secs: Some(2.84), stt_secs: Some(0.61) }));
-        log.translation("them:1", "Сколько лет?", Duration::from_millis(930));
+        log.translation("them:1", "Сколько лет?", Duration::from_millis(930), 0);
+        log.translation("them:1", "Сколько лет?", Duration::from_millis(2100), 1);
         log.utterance("me:1", Speaker::Me, "Cinco.", None);
         log.note("CONN THEM: connection lost: dropped (attempt 1, retry in 1 s)");
         log.stopped();
@@ -257,6 +259,7 @@ mod tests {
         assert!(text.contains("topic: topic"));
         assert!(text.contains("#1 THEM (speech 2.8 s, stt +0.6 s): ¿Cuántos años?"), "{text}");
         assert!(text.contains("#1 RU (+0.9 s): Сколько лет?"), "{text}");
+        assert!(text.contains("#1 RU (+2.1 s, 1 retry): Сколько лет?"), "{text}");
         assert!(text.contains("#2 ME  : Cinco.") && text.contains("stopped"));
         assert!(text.contains("CONN THEM: connection lost"));
         let _ = std::fs::remove_dir_all(d);

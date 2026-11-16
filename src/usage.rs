@@ -98,6 +98,7 @@ const DEFAULT_PRICES: &[(&str, Price)] = &[
     ("gpt-4o-transcribe", Price { input: 2.5, output: 10.0, per_minute: 0.006 }),
     ("gpt-4o-mini-transcribe", Price { input: 1.25, output: 5.0, per_minute: 0.003 }),
     ("openai/gpt-oss-20b:groq", Price { input: 0.10, output: 0.50, per_minute: 0.0 }),
+    ("Qwen/Qwen3-235B-A22B-Instruct-2507:parasail", Price { input: 0.14, output: 0.80, per_minute: 0.0 }),
     ("openai/gpt-oss-120b:groq", Price { input: 0.15, output: 0.75, per_minute: 0.0 }),
     ("openai/gpt-oss-120b:cerebras", Price { input: 0.35, output: 0.75, per_minute: 0.0 }),
 ];
