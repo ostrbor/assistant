@@ -1,6 +1,6 @@
 use crate::core::Core;
 use crate::record::HintTiming;
-use crate::state::{Hint, HintStatus, PREV_HINTS, Segment, Shared, Speaker, Verdict};
+use crate::state::{Addendum, Hint, HintStatus, PREV_HINTS, Segment, Shared, Speaker, Verdict};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -21,7 +21,7 @@ Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the questio
 const AUTO_RULE: &str = "\nThis request is automatic: it is made after every phrase of Them, and the user is already reading the 'Current hint on screen' (if there is one). \
 Compare the latest phrases of Them (all 'Them:' lines after the last 'Me:' line) with the current hint and start your answer with exactly one word on its own first line:\n\
 KEEP - nothing to change. Use it when the latest phrases are filler, thanks, an acknowledgement, small talk or talk to somebody else; when Them only repeat or rephrase the question the current hint already answers, without new information; when Them are still explaining and have not asked anything yet; or when the user has already fully answered. Output only the word KEEP and nothing else.\n\
-UPDATE - the latest phrases are about the same question as the current hint, but they add an explanation, a narrowing, an example or a rephrasing that makes a different or better answer. Write UPDATE, then the four lines below, with an answer to the whole question including the new details.\n\
+UPDATE - the latest phrases are about the same question as the current hint, but they add an explanation, a narrowing, an example or a rephrasing that calls for more in the answer. Write UPDATE, then the four lines below, but ES and RU hold ONLY the addition: one or two very short Spanish sentences that continue the current answer with what is new. The user may be reading the current hint aloud right now, so never repeat or reword it. Q is the refined question.\n\
 NEW - Them asked a different question or made a different request that the user has not answered. Write NEW, then the four lines below. Use NEW too when there is no current hint and a question is unanswered.\n\
 When in doubt between KEEP and UPDATE, choose UPDATE; when in doubt between UPDATE and NEW, choose NEW. Never answer KEEP when there is an unanswered question and no current hint.";
 
@@ -175,8 +175,9 @@ async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
     let mut query = vec![(focus, 3.0), (all.as_str(), 1.0)];
     // A bare "¿Es verdad?" or "¿y?" carries no topic: the current answer does, so a follow-up
     // finds the same pages as the question it refers to.
-    if let Some(h) = &current {
-        query.push((h.es.as_str(), 1.5));
+    let shown: String = current.iter().flat_map(|h| std::iter::once(h.es.as_str()).chain(h.addenda.iter().map(|a| a.es.as_str()))).collect::<Vec<_>>().join(" ");
+    if !shown.is_empty() {
+        query.push((shown.as_str(), 1.5));
     }
     let searched = Instant::now();
     let found = index.search(&query, core.cfg.hint_chunks.max(1));
@@ -194,13 +195,15 @@ async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
     }
     let screen = match (&current, requested) {
         (_, true) => String::new(),
-        (Some(h), _) => format!("\n\nCurrent hint on screen:\nQ: {}\nES: {}", h.question, h.es),
+        (Some(h), _) => {
+            let more: String = h.addenda.iter().map(|a| format!("\nAddition: {}", a.es)).collect();
+            format!("\n\nCurrent hint on screen:\nQ: {}\nES: {}{more}", h.question, h.es)
+        }
         (None, _) => "\n\nCurrent hint on screen: none".to_string(),
     };
     let user = format!("Transcript (latest last):\n{}{screen}\n\nDocument excerpts:\n{}", transcript.join("\n"), excerpts);
     let messages = json!([{ "role": "system", "content": system_prompt(mode) }, { "role": "user", "content": user }]);
 
-    let had_current = current.is_some();
     let mut hint = Hint { sources, started: Some(Instant::now()), ..Default::default() };
     let mut first_token = None;
     let streamed = core
@@ -213,7 +216,6 @@ async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
             if let Some(v @ (Verdict::New | Verdict::Update)) = verdict
                 && hint.has_content()
             {
-                hint.updated = v == Verdict::Update && had_current;
                 place(&core.shared, seq, mode, v, &hint);
             }
         })
@@ -232,7 +234,6 @@ async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    hint.updated = verdict == Verdict::Update && had_current;
     let placed = place(&core.shared, seq, mode, verdict, &hint);
     settle(core, HintStatus::Idle);
     let timing = HintTiming { model: streamed.model, search, first_token, total: t0.elapsed(), verdict: verdict.label(), placed };
@@ -257,12 +258,32 @@ async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Puts the hint of request `seq` on screen if that request may own it; false if a newer request
-/// does. The first words of a NEW hint move the hint that was on screen to the earlier ones; an
-/// UPDATE replaces it in place.
+/// Puts the result of request `seq` on screen if that request may; false if a newer one has the
+/// screen. The first words of a NEW hint move the hint that was on screen (with its additions) to
+/// the earlier ones. An UPDATE never touches the text on screen: it is appended below as an
+/// addition, so a hint the user is reading does not change under their eyes.
 fn place(shared: &Shared, seq: u64, mode: Mode, verdict: Verdict, h: &Hint) -> bool {
     let mut placed = false;
     shared.update(|s| {
+        let has_hint = s.hint.as_ref().is_some_and(Hint::has_content);
+        if mode == Mode::Auto && verdict == Verdict::Update && has_hint && seq != s.hint_owner {
+            let known = s.hint.as_ref().is_some_and(|c| c.addenda.iter().any(|a| a.seq == seq));
+            if !known && seq <= s.hint_owner.max(s.hint_kept).max(s.hint_upd) {
+                return;
+            }
+            let add = Addendum { seq, es: h.es.clone(), ru: h.ru.clone(), own: h.own };
+            let cur = s.hint.as_mut().expect("checked above");
+            match cur.addenda.iter_mut().find(|a| a.seq == seq) {
+                Some(a) => *a = add,
+                None => cur.addenda.push(add),
+            }
+            s.hint_upd = s.hint_upd.max(seq);
+            if s.hint_status == HintStatus::Checking {
+                s.hint_status = HintStatus::Writing;
+            }
+            placed = true;
+            return;
+        }
         let allowed = match mode {
             // The user asked: it wins over everything that started before it.
             Mode::Requested => seq >= s.hint_owner,
@@ -281,7 +302,12 @@ fn place(shared: &Shared, seq: u64, mode: Mode, verdict: Verdict, h: &Hint) -> b
             }
             s.hint_owner = seq;
         }
-        s.hint = Some(h.clone());
+        // The text of this request keeps streaming into the same slot; additions stay.
+        let mut shown = h.clone();
+        if let Some(old) = &s.hint {
+            shown.addenda = old.addenda.clone();
+        }
+        s.hint = Some(shown);
         if s.hint_status == HintStatus::Checking {
             s.hint_status = HintStatus::Writing;
         }
@@ -307,8 +333,12 @@ mod tests {
         shared.read(|s| (s.hint.as_ref().map_or(String::new(), |h| h.es.clone()), s.hint_prev.iter().map(|h| h.es.clone()).collect()))
     }
 
+    fn additions(shared: &Shared) -> Vec<String> {
+        shared.read(|s| s.hint.as_ref().map_or(vec![], |h| h.addenda.iter().map(|a| a.es.clone()).collect()))
+    }
+
     #[test]
-    fn new_hint_moves_the_old_one_down_and_update_replaces_in_place() {
+    fn new_hint_moves_the_old_one_down() {
         let shared = Shared::new(None);
         assert!(place(&shared, 1, Mode::Auto, Verdict::New, &hint("a")));
         assert!(place(&shared, 2, Mode::Auto, Verdict::New, &hint("b")));
@@ -316,14 +346,71 @@ mod tests {
         // The same request keeps streaming into the same slot.
         assert!(place(&shared, 2, Mode::Auto, Verdict::New, &hint("b2")));
         assert_eq!(screen(&shared), ("b2".into(), vec!["a".into()]));
-        // An update refines the hint without adding to the earlier ones.
-        assert!(place(&shared, 3, Mode::Auto, Verdict::Update, &hint("b3")));
-        assert_eq!(screen(&shared), ("b3".into(), vec!["a".into()]));
         // Only the last few earlier hints are kept.
         for (i, n) in ["c", "d", "e", "f"].iter().enumerate() {
-            place(&shared, 4 + i as u64, Mode::Auto, Verdict::New, &hint(n));
+            place(&shared, 3 + i as u64, Mode::Auto, Verdict::New, &hint(n));
         }
         assert_eq!(screen(&shared).1.len(), PREV_HINTS);
+    }
+
+    #[test]
+    fn update_is_appended_and_never_touches_the_text_on_screen() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &hint("main"));
+        assert!(place(&shared, 2, Mode::Auto, Verdict::Update, &hint("add 1")));
+        assert_eq!(screen(&shared), ("main".into(), vec![]));
+        assert_eq!(additions(&shared), ["add 1"]);
+        // The same update keeps streaming into its own block.
+        assert!(place(&shared, 2, Mode::Auto, Verdict::Update, &hint("add 1 longer")));
+        assert_eq!(additions(&shared), ["add 1 longer"]);
+        // A second update comes below the first.
+        assert!(place(&shared, 4, Mode::Auto, Verdict::Update, &hint("add 2")));
+        assert_eq!(additions(&shared), ["add 1 longer", "add 2"]);
+        // One that started before it (3) and comes late is dropped.
+        assert!(!place(&shared, 3, Mode::Auto, Verdict::Update, &hint("stale")));
+        assert_eq!(additions(&shared).len(), 2);
+    }
+
+    #[test]
+    fn main_text_keeps_streaming_after_an_update_and_keeps_the_additions() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &Hint { es: "ma".into(), question: "Q".into(), ..Default::default() });
+        place(&shared, 2, Mode::Auto, Verdict::Update, &hint("add"));
+        assert!(place(&shared, 1, Mode::Auto, Verdict::New, &hint("main complete")));
+        assert_eq!(screen(&shared).0, "main complete");
+        assert_eq!(additions(&shared), ["add"]);
+    }
+
+    #[test]
+    fn a_new_hint_takes_its_additions_to_the_earlier_ones() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &hint("a"));
+        place(&shared, 2, Mode::Auto, Verdict::Update, &hint("a+"));
+        place(&shared, 3, Mode::Auto, Verdict::New, &hint("b"));
+        assert_eq!(screen(&shared), ("b".into(), vec!["a".into()]));
+        assert!(additions(&shared).is_empty());
+        assert_eq!(shared.read(|s| s.hint_prev[0].addenda.len()), 1);
+    }
+
+    #[test]
+    fn update_with_nothing_on_screen_shows_as_the_hint() {
+        let shared = Shared::new(None);
+        assert!(place(&shared, 1, Mode::Auto, Verdict::Update, &hint("whole")));
+        assert_eq!(screen(&shared), ("whole".into(), vec![]));
+        assert!(additions(&shared).is_empty());
+        // It keeps streaming as the main text, not as an addition.
+        assert!(place(&shared, 1, Mode::Auto, Verdict::Update, &hint("whole 2")));
+        assert_eq!(screen(&shared).0, "whole 2");
+        assert!(additions(&shared).is_empty());
+    }
+
+    #[test]
+    fn an_update_older_than_a_keep_is_dropped() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &hint("a"));
+        shared.update(|s| s.hint_kept = 5);
+        assert!(!place(&shared, 4, Mode::Auto, Verdict::Update, &hint("late")));
+        assert!(place(&shared, 6, Mode::Auto, Verdict::Update, &hint("fresh")));
     }
 
     #[test]

@@ -290,6 +290,8 @@ impl eframe::App for App {
                             self.send(Cmd::Clear);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        ui.weak(concat!("Version ", env!("CARGO_PKG_VERSION")));
                     });
                     // Hamburger icon painted by hand (the default font may lack the glyph).
                     let rect = menu.response.rect;
@@ -418,9 +420,6 @@ impl eframe::App for App {
                         if let Some(a) = age {
                             ui.label(RichText::new(age_text(a)).size(13.0).weak()).on_hover_text("How long ago this hint was started");
                         }
-                        if hint.as_ref().is_some_and(|h| h.updated) {
-                            ui.label(RichText::new("updated").size(13.0).color(accent)).on_hover_text("Refined: they added details to the same question");
-                        }
                         if let Some((icon, word, tip, color)) = &status_info {
                             let r = ui.label(RichText::new(*word).size(13.0).color(*color));
                             status_icon(ui, *icon, *color).on_hover_text(tip);
@@ -464,6 +463,26 @@ impl eframe::App for App {
                             copy_menu(&r, &h.es, &mut self.pending_copy);
                         }
                     }
+                    // They added details to the same question: the new part goes below, the text above stays.
+                    for a in &h.addenda {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.label(RichText::new("+ Addition").size(13.0).color(accent));
+                        let color = match (stale, a.own) {
+                            (true, _) => Color32::GRAY,
+                            (false, true) => amber,
+                            (false, false) => ui.visuals().strong_text_color(),
+                        };
+                        let mut es = a.es.as_str();
+                        let r = ui.add(egui::TextEdit::multiline(&mut es).font(egui::FontId::proportional(26.0)).text_color(color).desired_rows(1).desired_width(f32::INFINITY).frame(false));
+                        if self.show_ru {
+                            copy_menu(&r, &format!("{}\n{}", a.es, a.ru), &mut self.pending_copy);
+                            let r = ui.label(RichText::new(&a.ru).size(18.0).color(ru_color));
+                            copy_menu(&r, &a.ru, &mut self.pending_copy);
+                        } else {
+                            copy_menu(&r, &a.es, &mut self.pending_copy);
+                        }
+                    }
                 }
                 }
                 // Hints that were replaced by a different question stay readable, collapsed.
@@ -479,6 +498,12 @@ impl eframe::App for App {
                                 ui.label(RichText::new(&p.ru).size(15.0).color(Color32::from_gray(120)));
                             } else {
                                 copy_menu(&r, &p.es, &mut self.pending_copy);
+                            }
+                            for a in &p.addenda {
+                                ui.label(RichText::new(format!("+ {}", a.es)).size(18.0).color(Color32::GRAY));
+                                if self.show_ru {
+                                    ui.label(RichText::new(&a.ru).size(14.0).color(Color32::from_gray(120)));
+                                }
                             }
                         });
                     }

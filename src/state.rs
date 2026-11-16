@@ -48,8 +48,19 @@ pub struct Hint {
     pub done: bool,
     pub sources: Vec<String>,
     pub started: Option<Instant>,
-    /// The hint replaced an earlier one for the same question because Them added something.
-    pub updated: bool,
+    /// Refinements that came after this hint was shown, newest last. They are appended below the
+    /// text instead of replacing it, so what the user is reading never changes under their eyes.
+    pub addenda: Vec<Addendum>,
+}
+
+/// A short continuation of the hint on screen, written when Them added details to the same question.
+#[derive(Clone, Default)]
+pub struct Addendum {
+    /// The request that wrote it (a streaming addendum is found again by this number).
+    pub seq: u64,
+    pub es: String,
+    pub ru: String,
+    pub own: bool,
 }
 
 /// What the model decided about an automatic request, from the first line of its answer.
@@ -206,6 +217,8 @@ pub struct AppState {
     pub hint_owner: u64,
     /// The newest request that answered KEEP: older requests that come late must not replace the screen.
     pub hint_kept: u64,
+    /// The newest request whose addendum was appended: an older UPDATE that comes late is dropped.
+    pub hint_upd: u64,
     /// What the hint machinery is doing right now (shown above the hint).
     pub hint_status: HintStatus,
     /// Document folders (subfolders of docs_dir) and the selected one.
