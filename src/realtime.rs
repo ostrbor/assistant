@@ -165,6 +165,43 @@ struct Conn<'a> {
     speaker: Speaker,
 }
 
+/// The session settings sent right after connecting (GA Realtime API shape; the beta one is
+/// disabled by OpenAI: `beta_api_shape_disabled`).
+fn session_update(cfg: &Transcribe, speaker: Speaker) -> Value {
+    let silence_ms = if speaker == Speaker::Me { cfg.mic_silence_ms } else { cfg.silence_ms };
+    let mut transcription = json!({ "model": cfg.model, "language": cfg.language });
+    if !cfg.prompt.trim().is_empty() {
+        transcription["prompt"] = json!(cfg.prompt.trim());
+    }
+    json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": { "input": {
+                "format": { "type": "audio/pcm", "rate": crate::audio::RATE },
+                "transcription": transcription,
+                "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": silence_ms }
+            } }
+        }
+    })
+}
+
+/// The text that tells the recognizer what to expect. A short utterance has little to go on, and
+/// without this it sometimes writes Spanish in Cyrillic; the language and topic keep it on track.
+pub fn stt_prompt(language: &str, topic: Option<&str>, extra: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if language == "es" {
+        parts.push("Conversación en español.".into());
+    }
+    if let Some(t) = topic.map(str::trim).filter(|t| !t.is_empty()) {
+        parts.push(format!("Tema: {t}."));
+    }
+    if !extra.trim().is_empty() {
+        parts.push(extra.trim().to_string());
+    }
+    parts.join(" ")
+}
+
 /// One connection. `up_since` is set once the session is established.
 async fn run(
     conn: &Conn<'_>,
@@ -182,19 +219,7 @@ async fn run(
         .map_err(describe_connect_error)?;
     let (mut w, mut r) = ws.split();
 
-    // GA Realtime API shape (the beta one is disabled by OpenAI: `beta_api_shape_disabled`).
-    let session = json!({
-        "type": "session.update",
-        "session": {
-            "type": "transcription",
-            "audio": { "input": {
-                "format": { "type": "audio/pcm", "rate": crate::audio::RATE },
-                "transcription": { "model": cfg.model, "language": cfg.language },
-                "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500 }
-            } }
-        }
-    });
-    send(&mut w, Message::Text(session.to_string())).await?;
+    send(&mut w, Message::Text(session_update(cfg, speaker).to_string())).await?;
     *up_since = Some(Instant::now());
     let _ = ev_tx.send(match lost_at {
         Some(t) => {
@@ -417,6 +442,33 @@ mod tests {
         assert!(!is_fatal(&io));
     }
 
+    #[test]
+    fn microphone_waits_longer_before_a_phrase_ends() {
+        let cfg = test_cfg();
+        let at = |sp| session_update(&cfg, sp)["session"]["audio"]["input"]["turn_detection"]["silence_duration_ms"].clone();
+        assert_eq!(at(Speaker::Them), json!(500));
+        assert_eq!(at(Speaker::Me), json!(900));
+    }
+
+    #[test]
+    fn prompt_is_sent_only_when_there_is_one() {
+        let mut cfg = test_cfg();
+        let t = |c: &Transcribe| session_update(c, Speaker::Them)["session"]["audio"]["input"]["transcription"].clone();
+        assert!(t(&cfg).get("prompt").is_none());
+        cfg.prompt = " Tema: álgebra. ".into();
+        assert_eq!(t(&cfg)["prompt"], json!("Tema: álgebra."));
+        assert_eq!(t(&cfg)["language"], json!("es"));
+    }
+
+    #[test]
+    fn recognizer_prompt_is_built_from_language_topic_and_extra() {
+        assert_eq!(stt_prompt("es", Some("algebra"), ""), "Conversación en español. Tema: algebra.");
+        assert_eq!(stt_prompt("es", None, "Cramer, determinante"), "Conversación en español. Cramer, determinante");
+        assert_eq!(stt_prompt("es", Some("  "), ""), "Conversación en español.");
+        // No Spanish sentence for another language.
+        assert_eq!(stt_prompt("en", Some("math"), ""), "Tema: math.");
+    }
+
     fn test_cfg() -> Transcribe {
         Transcribe {
             api_key: String::new(),
@@ -426,6 +478,9 @@ mod tests {
             silence_threshold: 300.0,
             mic_silence_threshold: 500.0,
             capture_mic: true,
+            silence_ms: 500,
+            mic_silence_ms: 900,
+            prompt: String::new(),
         }
     }
 
@@ -515,6 +570,9 @@ mod tests {
             silence_threshold: 300.0,
             mic_silence_threshold: 500.0,
             capture_mic: true,
+            silence_ms: 500,
+            mic_silence_ms: 900,
+            prompt: String::new(),
         };
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

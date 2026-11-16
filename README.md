@@ -129,6 +129,8 @@ Everything is in `config.toml`:
 | `[transcribe] api_key` | OpenAI API key. If empty, the variable named in `api_key_env` is used. |
 | `[llm] api_key` | Key of the LLM endpoint (Hugging Face token by default). If empty, the variable named in `api_key_env` is used. |
 | `[transcribe] model, language` | Realtime transcription model and the spoken language. |
+| `[transcribe] silence_ms, mic_silence_ms` | Quiet time in ms after which a phrase counts as finished: for the other person (default 500) and for your microphone (default 900, longer so that an answer with pauses stays in one piece). |
+| `[transcribe] prompt` | Extra words for the recognizer (names, terms). The language and the chosen document folder are sent along by themselves. |
 | `[transcribe] silence_threshold, mic_silence_threshold` | RMS level (16-bit samples, default 300 and 500) below which audio from the speakers / the microphone counts as silence and is not sent. Raise it if background noise keeps the stream open, lower it if quiet speech is cut off. |
 | `[transcribe] capture_mic` | `true` (default) also transcribes your own voice, so hints know what you already said. |
 | `[llm] base_url, api_key_env` | Any OpenAI-compatible endpoint and the environment variable holding its key. |

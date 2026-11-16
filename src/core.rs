@@ -338,10 +338,14 @@ fn spawn_stream(
     let threshold = core.shared.read(|s| s.meters[meter_idx(source)].threshold.clone());
     spawn_capture(&core.shared, source, threshold, stop, audio_tx, wav, Some(ev_tx.clone()));
 
+    // The chosen document folder is the topic of the call: it goes to the recognizer as context.
+    let mut tcfg = core.cfg.transcribe.clone();
+    let topic = core.shared.read(|s| s.topic.clone());
+    tcfg.prompt = realtime::stt_prompt(&tcfg.language, topic.as_deref(), &tcfg.prompt);
     let (core2, ev2, key) = (core.clone(), ev_tx.clone(), key.to_string());
     tokio::spawn(async move {
         let shared = core2.shared.clone();
-        if let Err(e) = realtime::run_with_reconnect(&core2.cfg.transcribe, realtime::REALTIME_URL, &key, audio_rx, shared, ev2.clone(), speaker).await {
+        if let Err(e) = realtime::run_with_reconnect(&tcfg, realtime::REALTIME_URL, &key, audio_rx, shared, ev2.clone(), speaker).await {
             // Only fatal errors (bad key, no access) get here; everything else is retried.
             let _ = ev2.send(Ev::Error(format!("Transcription: {e}")));
         }

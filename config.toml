@@ -29,6 +29,13 @@ silence_threshold = 300
 mic_silence_threshold = 500
 # Also transcribe your own voice (default input device) so hints know what you already said
 capture_mic = true
+# Quiet time (ms) after which a phrase counts as finished: the other person / your microphone.
+# Yours is longer so that an answer with pauses is not cut into pieces (each piece is transcribed worse).
+silence_ms = 500
+mic_silence_ms = 900
+# Extra words for the recognizer (names, terms), e.g. "determinante, Cramer". The language and the
+# chosen document folder are added by themselves and help it keep to Spanish.
+prompt = ""
 
 [llm]
 # LLM for translation and hints: any OpenAI-compatible endpoint (HF router by default)

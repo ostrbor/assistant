@@ -170,7 +170,9 @@ pub async fn run(cfg: &Config, topic: &str, persona_override: Option<String>, qu
     core::spawn_capture(&shared, audio::Source::Speakers, audio::threshold(cfg.transcribe.silence_threshold), &stop, audio_tx, None, None);
     let (ev_tx, _ev_rx) = unbounded_channel();
     let transcribe = {
-        let (tcfg, shared, key) = (cfg.transcribe.clone(), shared.clone(), key.clone());
+        let mut tcfg = cfg.transcribe.clone();
+        tcfg.prompt = realtime::stt_prompt(&tcfg.language, None, &tcfg.prompt);
+        let (shared, key) = (shared.clone(), key.clone());
         tokio::spawn(async move { realtime::run_with_reconnect(&tcfg, realtime::REALTIME_URL, &key, audio_rx, shared, ev_tx, Speaker::Them).await })
     };
 

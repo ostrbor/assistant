@@ -67,6 +67,16 @@ pub struct Transcribe {
     /// Also transcribe your own voice (default input device) so hints know what you already said.
     #[serde(default = "default_true")]
     pub capture_mic: bool,
+    /// Quiet time (ms) after which the other person's phrase counts as finished.
+    #[serde(default = "default_silence_ms")]
+    pub silence_ms: u64,
+    /// Same for your microphone. Longer: you pause to think, and a phrase cut in pieces is
+    /// transcribed worse (every piece without the context of the others).
+    #[serde(default = "default_mic_silence_ms")]
+    pub mic_silence_ms: u64,
+    /// Extra words for the recognizer (names, terms). The language and the chosen folder are added by themselves.
+    #[serde(default)]
+    pub prompt: String,
 }
 
 fn default_silence_threshold() -> f64 {
@@ -75,6 +85,14 @@ fn default_silence_threshold() -> f64 {
 
 fn default_mic_silence_threshold() -> f64 {
     500.0
+}
+
+fn default_silence_ms() -> u64 {
+    500
+}
+
+fn default_mic_silence_ms() -> u64 {
+    900
 }
 
 fn default_hint_chunks() -> usize {
