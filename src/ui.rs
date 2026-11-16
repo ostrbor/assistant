@@ -94,6 +94,13 @@ fn bold_family() -> egui::FontFamily {
 /// glyph the bold font lacks.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // The model sometimes writes U+202F / U+2011, which the proportional font lacks (drawn as a
+    // square); the built-in Hack font has them, so it goes last as a fallback.
+    if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if !chain.iter().any(|n| n == "Hack") {
+            chain.push("Hack".to_string());
+        }
+    }
     fonts.font_data.insert("dejavu-bold".into(), egui::FontData::from_static(include_bytes!("../assets/DejaVuSans-Bold.ttf")));
     let mut chain = vec!["dejavu-bold".to_string()];
     chain.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
