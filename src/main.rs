@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let handle = rt.handle().clone();
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([720.0, 820.0]).with_always_on_top().with_title("Assistant"),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([440.0, 820.0]).with_always_on_top().with_title("Assistant"),
         // Remember window size and position between runs.
         persist_window: true,
         ..Default::default()
