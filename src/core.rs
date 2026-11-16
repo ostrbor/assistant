@@ -448,16 +448,16 @@ fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
                 "ok": res.is_ok(),
             }),
         );
-        let en = match res {
+        let ru = match res {
             Ok(t) => t,
             Err(e) => format!("[translation error: {e}]"),
         };
         if let Some(r) = &rec {
-            r.translation(&id, &en, took);
+            r.translation(&id, &ru, took);
         }
         core2.shared.update(|s| {
             if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == id) {
-                seg.en = Some(en);
+                seg.ru = Some(ru);
             }
         });
     });

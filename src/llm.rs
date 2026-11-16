@@ -76,7 +76,7 @@ impl Llm {
         }
         user.push_str(&format!("Utterance to translate:\n{es}"));
         let messages = json!([
-            { "role": "system", "content": "Translate the Spanish utterance from a video call into natural English. Output only the translation of the last utterance, nothing else." },
+            { "role": "system", "content": "Translate the Spanish utterance from a video call into natural Russian. Output only the translation of the last utterance, nothing else." },
             { "role": "user", "content": user }
         ]);
         let started = Instant::now();

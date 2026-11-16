@@ -390,13 +390,13 @@ impl eframe::App for App {
                             copy_menu(&r, &h.question, &mut self.pending_copy);
                         });
                     }
-                    let (es_color, en_color) = match (stale, h.own) {
+                    let (es_color, ru_color) = match (stale, h.own) {
                         (true, _) => (Color32::GRAY, Color32::from_gray(120)),
                         (false, true) => (amber, Color32::LIGHT_BLUE),
                         (false, false) => (ui.visuals().strong_text_color(), Color32::LIGHT_BLUE),
                     };
                     if h.done && h.es.is_empty() {
-                        // The model broke the Q/ES/EN format: show what it actually said.
+                        // The model broke the Q/ES/RU format: show what it actually said.
                         let msg = if h.raw.trim().is_empty() { "The model returned an empty answer." } else { h.raw.trim() };
                         let r = ui.label(RichText::new(msg).size(26.0).color(es_color));
                         copy_menu(&r, msg, &mut self.pending_copy);
@@ -410,9 +410,9 @@ impl eframe::App for App {
                                 .desired_width(f32::INFINITY)
                                 .frame(false),
                         );
-                        copy_menu(&r, &format!("{}\n{}", h.es, h.en), &mut self.pending_copy);
-                        let r = ui.label(RichText::new(&h.en).size(18.0).color(en_color));
-                        copy_menu(&r, &h.en, &mut self.pending_copy);
+                        copy_menu(&r, &format!("{}\n{}", h.es, h.ru), &mut self.pending_copy);
+                        let r = ui.label(RichText::new(&h.ru).size(18.0).color(ru_color));
+                        copy_menu(&r, &h.ru, &mut self.pending_copy);
                     }
                     if !h.done {
                         ui.spinner();
@@ -448,13 +448,13 @@ impl eframe::App for App {
                             es = es.italics().color(Color32::from_gray(175));
                         }
                         let r = ui.label(es);
-                        let whole = match &seg.en {
-                            Some(en) => format!("{}\n{en}", seg.es),
+                        let whole = match &seg.ru {
+                            Some(ru) => format!("{}\n{ru}", seg.es),
                             None => seg.es.clone(),
                         };
                         copy_menu(&r, &whole, &mut self.pending_copy);
-                        if let Some(en) = &seg.en {
-                            let r = ui.label(RichText::new(en).size(17.0).color(Color32::from_rgb(150, 190, 235)));
+                        if let Some(ru) = &seg.ru {
+                            let r = ui.label(RichText::new(ru).size(17.0).color(Color32::from_rgb(150, 190, 235)));
                             copy_menu(&r, &whole, &mut self.pending_copy);
                         } else if !seg.partial {
                             // Translation in progress.

@@ -2,8 +2,8 @@
 
 A small desktop window for Linux that helps you follow a Spanish-language call (Zoom, Google Meet or anything else that plays through your speakers):
 
-- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with an English translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
-- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with an English translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. The hint also appears by itself: ~1.2 s after the other person stops talking, the model checks whether they asked something and, if so, the hint streams into the panel. A status line above the hint says what is happening (*They are speaking…*, *Checking whether that was a question…*, *Writing the hint…*, *No question in what they just said*), so you know whether to wait or press *Hint*.
+- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with a Russian translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
+- **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with a Russian translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. The hint also appears by itself: ~1.2 s after the other person stops talking, the model checks whether they asked something and, if so, the hint streams into the panel. A status line above the hint says what is happening (*They are speaking…*, *Checking whether that was a question…*, *Writing the hint…*, *No question in what they just said*), so you know whether to wait or press *Hint*.
 
 The window stays on top of other windows. The other person is captured from what plays through the speakers, you from your default microphone. **Use headphones**: through speakers, their voice leaks into your microphone and shows up as `Me:` lines. To turn the microphone off, set `capture_mic = false`.
 
@@ -13,7 +13,7 @@ The window stays on top of other windows. The other person is captured from what
 speaker output ──► sound-server monitor ─┐  (silence dropped)
 microphone ──────► default input ──────┴► OpenAI Realtime (one session each) ──► subtitles
                                                                   │
-                          finished sentence ──► LLM (translation) ──► English line
+                          finished sentence ──► LLM (translation) ──► Russian line
                                                                   │
                    question detected ──► BM25 search in your PDFs ──► LLM ──► hint
 ```
@@ -43,7 +43,7 @@ On the first start the app creates `~/assistant/` with a default `config.toml` a
 
 **Session records.** Every Listen → Stop creates `~/assistant/sessions/<date_time>/` with `session.log` (transcript, translations, hints with their sources, errors; times are offsets from the start) and the raw audio `them.wav` (speakers) and `me.wav` (microphone, recorded before the silence filter). They are for debugging and are never deleted automatically (about 170 MB per hour per file).
 
-**Timings and service events.** `session.log` starts with the wall-clock start time; every line carries the offset from it. Utterances show how long the speech was and how long it took to become text (`(speech 2.8 s, stt +0.6 s)`), translations show their delay (`EN (+0.9 s)`), hints show the model that won, the document search time, the time to the first token and the total. Service events are logged too: `CONN THEM: connection lost … (attempt 1, retry in 1 s)`, `reconnected after 1.4 s offline`, server errors, `AUDIO …` device losses.
+**Timings and service events.** `session.log` starts with the wall-clock start time; every line carries the offset from it. Utterances show how long the speech was and how long it took to become text (`(speech 2.8 s, stt +0.6 s)`), translations show their delay (`RU (+0.9 s)`), hints show the model that won, the document search time, the time to the first token and the total. Service events are logged too: `CONN THEM: connection lost … (attempt 1, retry in 1 s)`, `reconnected after 1.4 s offline`, server errors, `AUDIO …` device losses.
 
 For comparing recordings, `events.jsonl` in the same folder has one JSON object per event with `t` (seconds from the session start) and `ev`. Stages: `speech_started` / `speech_stopped` / `committed` / `first_delta` / `stt_completed` (`stt_ms` = end of speech → final text), `translate` (`ms`), `hint_start` / `hint_search` / `hint_model` (one per model in the race: `first_token_ms`, `total_ms`, `outcome`) / `hint_done` / `hint_shown`, and `conn_up` / `conn_lost` / `conn_reconnected` / `server_error` / `audio_lost` / `audio_recovered`. Median speech-to-text delay over several sessions:
 
@@ -110,7 +110,7 @@ cargo run --release -- --topic project_x     # preselect a document folder
 
 If there is a single folder under `docs/`, it is selected automatically. Pick a folder **before** pressing *Hint*; without one you get `select a document folder first`.
 
-Hint panel layout: the sources (file and page), the question as the app understood it (in English), the Spanish answer in large type, and its English translation below. When your documents do not contain the answer, the model answers from its own knowledge instead of saying it has no information; such a hint is marked with an amber line "Generated by the model - not found in your documents", its Spanish text is amber, and no sources are listed. For personal facts (employers, dates, numbers) it gives a generic answer rather than inventing specifics: check those before saying them.
+Hint panel layout: the sources (file and page), the question as the app understood it (in Russian), the Spanish answer in large type, and its Russian translation below. When your documents do not contain the answer, the model answers from its own knowledge instead of saying it has no information; such a hint is marked with an amber line "Generated by the model - not found in your documents", its Spanish text is amber, and no sources are listed. For personal facts (employers, dates, numbers) it gives a generic answer rather than inventing specifics: check those before saying them.
 
 A typical call: start the app and choose the folder. Press *Listen* when the conversation turns to you, press *Hint* after a question, and press *Stop* when the conversation moves on to someone else.
 

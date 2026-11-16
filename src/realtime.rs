@@ -341,7 +341,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
                 if let Some(seg) = s.segments.iter_mut().find(|x| x.item_id == item_id) {
                     seg.es.push_str(&delta);
                 } else {
-                    s.segments.push(Segment { item_id, speaker, es: delta, en: None, partial: true, at: Instant::now() });
+                    s.segments.push(Segment { item_id, speaker, es: delta, ru: None, partial: true, at: Instant::now() });
                 }
             });
         }
@@ -368,7 +368,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
                     seg.es = full.clone();
                     seg.partial = false;
                 } else {
-                    s.segments.push(Segment { item_id: item_id.clone(), speaker, es: full.clone(), en: None, partial: false, at: Instant::now() });
+                    s.segments.push(Segment { item_id: item_id.clone(), speaker, es: full.clone(), ru: None, partial: false, at: Instant::now() });
                 }
             });
             if let Some((input_tokens, output_tokens, seconds)) = crate::usage::parse_transcribe_usage(&v) {

@@ -13,7 +13,7 @@ Use 2-3 very short, simple Spanish sentences (A1-A2: present tense, basic vocabu
 If the excerpts contain the answer, base the answer ONLY on them and write 'SRC: DOCS'. \
 If they do not contain it (or only a part of it), NEVER say that you have no information: answer the question yourself from your general knowledge, correctly and briefly, and write 'SRC: OWN'. \
 For personal facts about the user that are not in the excerpts (employers, dates, numbers, names, years of experience) do not invent specifics: give a plain generic answer and write 'SRC: OWN'. \
-Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in English>\nES: <the answer in Spanish>\nEN: <English translation of the answer>";
+Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in Russian>\nES: <the answer in Spanish>\nRU: <Russian translation of the answer>";
 
 /// Added to the prompt of automatic hints, which fire after every turn of the other person.
 const AUTO_RULE: &str = "\nThis request is automatic, made after every turn of Them. If the last thing Them said contains no question or request addressed to the user \
@@ -195,7 +195,7 @@ async fn run(core: &Arc<Core>, mode: Mode) -> anyhow::Result<()> {
             "first_token_ms": timing.first_token.map(|d| d.as_millis() as u64),
             "total_ms": timing.total.as_millis() as u64,
             "own": hint.own,
-            "chars": hint.es.chars().count() + hint.en.chars().count(),
+            "chars": hint.es.chars().count() + hint.ru.chars().count(),
         }),
     );
     if let Some(r) = core.rec() {
@@ -224,7 +224,7 @@ mod tests {
 
     fn seg(text: &str, age_secs: u64) -> Segment {
         let at = Instant::now().checked_sub(Duration::from_secs(age_secs)).expect("clock");
-        Segment { item_id: text.into(), speaker: Speaker::Them, es: text.into(), en: None, partial: false, at }
+        Segment { item_id: text.into(), speaker: Speaker::Them, es: text.into(), ru: None, partial: false, at }
     }
 
     #[test]

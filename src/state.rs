@@ -32,7 +32,7 @@ pub struct Segment {
     pub item_id: String,
     pub speaker: Speaker,
     pub es: String,
-    pub en: Option<String>,
+    pub ru: Option<String>,
     pub partial: bool,
     pub at: Instant,
 }
@@ -41,7 +41,7 @@ pub struct Segment {
 pub struct Hint {
     pub question: String,
     pub es: String,
-    pub en: String,
+    pub ru: String,
     pub raw: String,
     /// The answer is not from the user's documents: the model produced it from its own knowledge.
     pub own: bool,
@@ -51,10 +51,10 @@ pub struct Hint {
 }
 
 impl Hint {
-    /// Parses streamed text in the format `SRC: DOCS|OWN / Q: … / ES: … / EN: …`.
+    /// Parses streamed text in the format `SRC: DOCS|OWN / Q: … / ES: … / RU: …`.
     pub fn apply_raw(&mut self, raw: &str) {
         self.raw = raw.to_string();
-        const PREFIXES: [&str; 4] = ["Q:", "ES:", "EN:", "SRC:"];
+        const PREFIXES: [&str; 4] = ["Q:", "ES:", "RU:", "SRC:"];
         let mut fields: [String; 4] = Default::default();
         let mut cur = None;
         for line in raw.lines().map(str::trim) {
@@ -70,8 +70,8 @@ impl Hint {
             }
             fields[i].push_str(rest.trim());
         }
-        let [question, es, en, src] = fields;
-        (self.question, self.es, self.en) = (question, es, en);
+        let [question, es, ru, src] = fields;
+        (self.question, self.es, self.ru) = (question, es, ru);
         self.own = src.trim().to_uppercase().starts_with("OWN");
     }
 
@@ -211,10 +211,10 @@ mod tests {
     #[test]
     fn source_marker_is_parsed() {
         let mut h = Hint::default();
-        h.apply_raw("SRC: OWN\nQ: What is a tautology?\nES: Es una fórmula siempre verdadera.\nEN: It is always true.");
+        h.apply_raw("SRC: OWN\nQ: Что такое тавтология?\nES: Es una fórmula siempre verdadera.\nRU: Это всегда истинно.");
         assert!(h.own);
-        assert_eq!((h.question.as_str(), h.es.as_str()), ("What is a tautology?", "Es una fórmula siempre verdadera."));
-        h.apply_raw("SRC: DOCS\nQ: x\nES: y\nEN: z");
+        assert_eq!((h.question.as_str(), h.es.as_str()), ("Что такое тавтология?", "Es una fórmula siempre verdadera."));
+        h.apply_raw("SRC: DOCS\nQ: x\nES: y\nRU: z");
         assert!(!h.own);
         // No marker (old format or still streaming): treated as from the documents.
         h.apply_raw("Q: x\nES: y");
@@ -228,16 +228,16 @@ mod tests {
         let mut h = Hint::default();
         h.apply_raw("NONE");
         assert!(h.is_none() && !h.has_content());
-        h.apply_raw("SRC: OWN\nQ: x\nES: hola\nEN: hi");
+        h.apply_raw("SRC: OWN\nQ: x\nES: hola\nRU: привет");
         assert!(!h.is_none() && h.has_content());
     }
 
     #[test]
     fn parses_streaming_hint() {
         let mut h = Hint::default();
-        h.apply_raw("Q: How much experience?\nES: Tengo cinco años.\nEN: I have five years.");
-        assert_eq!((h.question.as_str(), h.es.as_str(), h.en.as_str()), ("How much experience?", "Tengo cinco años.", "I have five years."));
+        h.apply_raw("Q: Сколько опыта?\nES: Tengo cinco años.\nRU: У меня пять лет.");
+        assert_eq!((h.question.as_str(), h.es.as_str(), h.ru.as_str()), ("Сколько опыта?", "Tengo cinco años.", "У меня пять лет."));
         h.apply_raw("Q: How much\nES: Ten");
-        assert_eq!((h.question.as_str(), h.es.as_str(), h.en.as_str()), ("How much", "Ten", ""));
+        assert_eq!((h.question.as_str(), h.es.as_str(), h.ru.as_str()), ("How much", "Ten", ""));
     }
 }
