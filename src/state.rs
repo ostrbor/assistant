@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,11 +38,49 @@ pub struct Segment {
     pub at: Instant,
 }
 
+/// Text with the `**key words**` markers of the model taken out: `bold` holds the byte ranges of
+/// the marked words inside `text`, so everything that reads `text` (copy, search, the log) sees
+/// plain words.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Marked {
+    pub text: String,
+    pub bold: Vec<Range<usize>>,
+}
+
+impl Marked {
+    /// Splits `s` at `**`. A span that is not closed yet (the answer is still streaming) runs to the
+    /// end, so half-written markers never show up as asterisks. A single `*` is dropped.
+    pub fn parse(s: &str) -> Marked {
+        let mut text = String::with_capacity(s.len());
+        let mut bold = Vec::new();
+        let mut open: Option<usize> = None;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '*' {
+                text.push(c);
+            } else if chars.next_if_eq(&'*').is_some() {
+                match open.take() {
+                    Some(start) => bold.push(start..text.len()),
+                    None => open = Some(text.len()),
+                }
+            }
+        }
+        if let Some(start) = open {
+            bold.push(start..text.len());
+        }
+        bold.retain(|r| !r.is_empty());
+        Marked { text, bold }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Hint {
     pub question: String,
     pub es: String,
     pub ru: String,
+    /// Byte ranges of the key words inside `es` / `ru`.
+    pub es_bold: Vec<Range<usize>>,
+    pub ru_bold: Vec<Range<usize>>,
     pub raw: String,
     /// The answer is not from the user's documents: the model produced it from its own knowledge.
     pub own: bool,
@@ -60,6 +99,8 @@ pub struct Addendum {
     pub seq: u64,
     pub es: String,
     pub ru: String,
+    pub es_bold: Vec<Range<usize>>,
+    pub ru_bold: Vec<Range<usize>>,
     pub own: bool,
 }
 
@@ -121,7 +162,10 @@ impl Hint {
             fields[i].push_str(rest.trim());
         }
         let [question, es, ru, src] = fields;
-        (self.question, self.es, self.ru) = (question, es, ru);
+        let (es, ru) = (Marked::parse(&es), Marked::parse(&ru));
+        self.question = Marked::parse(&question).text;
+        (self.es, self.es_bold) = (es.text, es.bold);
+        (self.ru, self.ru_bold) = (ru.text, ru.bold);
         self.own = src.trim().to_uppercase().starts_with("OWN");
     }
 
@@ -261,7 +305,45 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hint, Verdict};
+    use super::{Hint, Marked, Verdict};
+
+    fn words<'a>(m: &'a Marked) -> Vec<&'a str> {
+        m.bold.iter().map(|r| &m.text[r.clone()]).collect()
+    }
+
+    #[test]
+    fn key_words_are_cut_out_of_the_text() {
+        let m = Marked::parse("Trabajo en **Google** desde **2020** años");
+        assert_eq!(m.text, "Trabajo en Google desde 2020 años");
+        assert_eq!(words(&m), ["Google", "2020"]);
+        assert_eq!(Marked::parse("sin marcas"), Marked { text: "sin marcas".into(), bold: vec![] });
+    }
+
+    #[test]
+    fn half_written_markers_never_show_asterisks() {
+        let m = Marked::parse("Quiero **mejorar mi esp");
+        assert_eq!((m.text.as_str(), words(&m)), ("Quiero mejorar mi esp", vec!["mejorar mi esp"]));
+        let m = Marked::parse("Quiero **mejorar** mi*");
+        assert_eq!(m.text, "Quiero mejorar mi");
+        assert_eq!(words(&m), ["mejorar"]);
+        assert!(Marked::parse("hola ****").bold.is_empty());
+    }
+
+    #[test]
+    fn non_ascii_key_words_stay_on_char_boundaries() {
+        let m = Marked::parse("**Después** trabajo; **опыт** пять лет");
+        assert_eq!(words(&m), ["Después", "опыт"]);
+        assert_eq!(m.text, "Después trabajo; опыт пять лет");
+    }
+
+    #[test]
+    fn hint_text_is_plain_and_the_bold_ranges_point_into_it() {
+        let mut h = Hint::default();
+        h.apply_raw("SRC: OWN\nQ: ¿Qué **haces**?\nES: Trabajo en **banco**.\nRU: Работаю в **банке**.");
+        assert_eq!((h.question.as_str(), h.es.as_str(), h.ru.as_str()), ("¿Qué haces?", "Trabajo en banco.", "Работаю в банке."));
+        assert_eq!(&h.es[h.es_bold[0].clone()], "banco");
+        assert_eq!(&h.ru[h.ru_bold[0].clone()], "банке");
+    }
 
     #[test]
     fn unprefixed_text_is_kept_in_raw() {

@@ -10,13 +10,14 @@ const SYSTEM: &str = "You help the user answer questions in a Spanish-language v
 You receive the recent transcript of the call, where lines starting with 'Them:' are the other person and lines starting with 'Me:' are the user, and excerpts from the user's own documents. \
 Find the last question from Them that the user (Me) has not fully answered yet and answer it in the first person. \
 If the user already answered it, suggest a short natural addition or continuation that does not repeat what the user said. \
-Use 2-3 very short, simple Spanish sentences (A1-A2: present tense, basic vocabulary, no subjunctive). \
+Write the Spanish the way a beginner foreigner speaks: 2-3 very short, simple sentences (A1-A2: present tense, basic vocabulary, no subjunctive), as few words as possible, and NEVER use articles (no el, la, los, las, un, una, unos, unas; write 'a' instead of 'al' and 'de' instead of 'del'), e.g. 'Trabajo en banco desde dos años' and not 'Trabajo en el banco desde hace dos años'. \
+In ES and in RU wrap the 2-4 most important words or short phrases (the facts of the answer: terms, numbers, names, the main verb) in **double asterisks**, the same ideas in both lines, so that one glance at the bold words shows what the answer is about. Use no other markup, and none in Q. \
 If the excerpts contain the answer, base the answer ONLY on them and write 'SRC: DOCS'. \
 If they do not contain it (or only a part of it), NEVER say that you have no information: answer the question yourself from your general knowledge, correctly and briefly, and write 'SRC: OWN'. \
 For personal facts about the user that are not in the excerpts (employers, dates, numbers, names, years of experience) do not invent specifics: give a plain generic answer and write 'SRC: OWN'. \
 Q must be a question or request that Them really asked in the transcript. An offer or a plan ('I can show you a matrix') is not a question. \
-Never invent what you cannot see: if the answer needs something shown on a screen (a matrix, a picture, a formula) that is not in the transcript, do not guess, write in ES a polite request to show or read it, e.g. '¿Puede mostrar la matriz, por favor?'. \
-If the question is so badly recognised that you cannot tell what is asked, write in ES '¿Puede repetir la pregunta, por favor?'. \
+Never invent what you cannot see: if the answer needs something shown on a screen (a matrix, a picture, a formula) that is not in the transcript, do not guess, write in ES a polite request to show or read it, e.g. '¿Puede mostrar matriz, por favor?'. \
+If the question is so badly recognised that you cannot tell what is asked, write in ES '¿Puede repetir pregunta, por favor?'. \
 The user message names the topic of the call: write the Russian lines with the standard Russian terms of that field. \
 Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in Russian>\nES: <the answer in Spanish>\nRU: <Russian translation of the answer>";
 
@@ -25,7 +26,7 @@ Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the questio
 const AUTO_RULE: &str = "\nThis request is automatic: it is made after every phrase of Them, and the user is already reading the 'Current hint on screen' (if there is one). \
 Compare the latest phrases of Them (all 'Them:' lines after the last 'Me:' line) with the current hint and start your answer with exactly one word on its own first line:\n\
 KEEP - nothing to change. Use it when the latest phrases are filler, thanks, praise, a goodbye, an acknowledgement, small talk or talk to somebody else (\"muchas gracias\", \"perfecto\", \"hasta luego\" never start a new hint, even if an earlier question is still unanswered); when Them only repeat or rephrase the question the current hint already answers, without new information; when Them are still explaining and have not asked anything yet; or when the user has already fully answered. Output only the word KEEP and nothing else.\n\
-UPDATE - the latest phrases are about the same question as the current hint, but they add an explanation, a narrowing, an example or a rephrasing that calls for more in the answer. Write UPDATE, then the four lines below, but ES and RU hold ONLY the addition: one or two very short Spanish sentences that continue the current answer with what is new. The user may be reading the current hint aloud right now, so never repeat or reword it. Q is the refined question.\n\
+UPDATE - the latest phrases are about the same question as the current hint, but they add an explanation, a narrowing, an example or a rephrasing that calls for more in the answer. Write UPDATE, then the four lines below, but ES and RU hold ONLY the addition: one or two very short Spanish sentences that continue the current answer with what is new, in the same style (no articles, key words in **double asterisks**). The user may be reading the current hint aloud right now, so never repeat or reword it. Q is the refined question.\n\
 NEW - Them asked a different question or made a different request that the user has not answered. Write NEW, then the four lines below. Use NEW too when there is no current hint and a question is unanswered.\n\
 When in doubt between KEEP and UPDATE, choose UPDATE; when in doubt between UPDATE and NEW, choose NEW. Never answer KEEP when there is an unanswered question and no current hint.";
 
@@ -276,7 +277,7 @@ fn place(shared: &Shared, seq: u64, mode: Mode, verdict: Verdict, h: &Hint) -> b
             if !known && seq <= s.hint_owner.max(s.hint_kept).max(s.hint_upd) {
                 return;
             }
-            let add = Addendum { seq, es: h.es.clone(), ru: h.ru.clone(), own: h.own };
+            let add = Addendum { seq, es: h.es.clone(), ru: h.ru.clone(), es_bold: h.es_bold.clone(), ru_bold: h.ru_bold.clone(), own: h.own };
             let cur = s.hint.as_mut().expect("checked above");
             match cur.addenda.iter_mut().find(|a| a.seq == seq) {
                 Some(a) => *a = add,

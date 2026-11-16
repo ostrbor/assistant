@@ -1,5 +1,6 @@
 use crate::core::Cmd;
 use crate::docs::FileStatus;
+use std::ops::Range;
 use crate::state::{AppState, AudioMeter, DocsReport, HintStatus, METER_FRAMES, Shared, Speaker};
 use eframe::egui::{self, Align, Color32, RichText};
 use std::time::{Duration, Instant};
@@ -84,6 +85,53 @@ fn icon_button(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, fill: Option<C
 
 /// Right-click on text: with a selection it is copied at once (like in a terminal);
 /// without one a small menu offers to copy the whole item.
+/// Family of the bold face (egui's default fonts have no bold weight).
+fn bold_family() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+/// Registers the bold face next to the default fonts; the default ones stay as fallback for any
+/// glyph the bold font lacks.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("dejavu-bold".into(), egui::FontData::from_static(include_bytes!("../assets/DejaVuSans-Bold.ttf")));
+    let mut chain = vec!["dejavu-bold".to_string()];
+    chain.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(bold_family(), chain);
+    ctx.set_fonts(fonts);
+}
+
+/// The text with the key words (byte ranges) in the bold face.
+fn marked_job(text: &str, bold: &[Range<usize>], size: f32, color: Color32, wrap_width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let plain = egui::text::TextFormat { font_id: egui::FontId::proportional(size), color, ..Default::default() };
+    let strong = egui::text::TextFormat { font_id: egui::FontId::new(size, bold_family()), color, ..Default::default() };
+    let mut pos = 0;
+    for r in bold {
+        // Ranges come from the parser in order; skip anything that does not fit the text.
+        if r.start < pos || r.end > text.len() || !text.is_char_boundary(r.start) || !text.is_char_boundary(r.end) {
+            continue;
+        }
+        job.append(&text[pos..r.start], 0.0, plain.clone());
+        job.append(&text[r.clone()], 0.0, strong.clone());
+        pos = r.end;
+    }
+    job.append(&text[pos..], 0.0, plain);
+    job
+}
+
+fn marked_label(text: &str, bold: &[Range<usize>], size: f32, color: Color32) -> egui::text::LayoutJob {
+    marked_job(text, bold, size, color, f32::INFINITY)
+}
+
+/// Selectable multi-line text with its key words in bold.
+fn marked_edit(ui: &mut egui::Ui, text: &str, bold: &[Range<usize>], size: f32, color: Color32, rows: usize) -> egui::Response {
+    let mut buf = text;
+    let mut layouter = |ui: &egui::Ui, t: &str, wrap: f32| ui.fonts(|f| f.layout_job(marked_job(t, bold, size, color, wrap)));
+    ui.add(egui::TextEdit::multiline(&mut buf).font(egui::FontId::proportional(size)).layouter(&mut layouter).desired_rows(rows).desired_width(f32::INFINITY).frame(false))
+}
+
 fn copy_menu(resp: &egui::Response, whole: &str, pending_copy: &mut bool) {
     if egui::text_selection::LabelSelectionState::load(&resp.ctx).has_selection() {
         if resp.secondary_clicked() {
@@ -446,18 +494,10 @@ impl eframe::App for App {
                         let r = ui.label(RichText::new(msg).size(26.0).color(es_color));
                         copy_menu(&r, msg, &mut self.pending_copy);
                     } else {
-                        let mut es = h.es.as_str();
-                        let r = ui.add(
-                            egui::TextEdit::multiline(&mut es)
-                                .font(egui::FontId::proportional(26.0))
-                                .text_color(es_color)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .frame(false),
-                        );
+                        let r = marked_edit(ui, &h.es, &h.es_bold, 26.0, es_color, 2);
                         if self.show_ru {
                             copy_menu(&r, &format!("{}\n{}", h.es, h.ru), &mut self.pending_copy);
-                            let r = ui.label(RichText::new(&h.ru).size(18.0).color(ru_color));
+                            let r = ui.label(marked_label(&h.ru, &h.ru_bold, 18.0, ru_color));
                             copy_menu(&r, &h.ru, &mut self.pending_copy);
                         } else {
                             copy_menu(&r, &h.es, &mut self.pending_copy);
@@ -473,11 +513,10 @@ impl eframe::App for App {
                             (false, true) => amber,
                             (false, false) => ui.visuals().strong_text_color(),
                         };
-                        let mut es = a.es.as_str();
-                        let r = ui.add(egui::TextEdit::multiline(&mut es).font(egui::FontId::proportional(26.0)).text_color(color).desired_rows(1).desired_width(f32::INFINITY).frame(false));
+                        let r = marked_edit(ui, &a.es, &a.es_bold, 26.0, color, 1);
                         if self.show_ru {
                             copy_menu(&r, &format!("{}\n{}", a.es, a.ru), &mut self.pending_copy);
-                            let r = ui.label(RichText::new(&a.ru).size(18.0).color(ru_color));
+                            let r = ui.label(marked_label(&a.ru, &a.ru_bold, 18.0, ru_color));
                             copy_menu(&r, &a.ru, &mut self.pending_copy);
                         } else {
                             copy_menu(&r, &a.es, &mut self.pending_copy);
@@ -492,17 +531,19 @@ impl eframe::App for App {
                     for (i, p) in hint_prev.iter().enumerate() {
                         let title = if p.question.is_empty() { p.es.as_str() } else { p.question.as_str() };
                         egui::CollapsingHeader::new(RichText::new(title).size(15.0).color(ui.visuals().weak_text_color())).id_salt(("earlier", i)).show(ui, |ui| {
-                            let r = ui.label(RichText::new(&p.es).size(20.0).color(Color32::GRAY));
+                            let r = ui.label(marked_label(&p.es, &p.es_bold, 20.0, Color32::GRAY));
                             if self.show_ru {
                                 copy_menu(&r, &format!("{}\n{}", p.es, p.ru), &mut self.pending_copy);
-                                ui.label(RichText::new(&p.ru).size(15.0).color(Color32::from_gray(120)));
+                                ui.label(marked_label(&p.ru, &p.ru_bold, 15.0, Color32::from_gray(120)));
                             } else {
                                 copy_menu(&r, &p.es, &mut self.pending_copy);
                             }
                             for a in &p.addenda {
-                                ui.label(RichText::new(format!("+ {}", a.es)).size(18.0).color(Color32::GRAY));
+                                let shift = "+ ".len();
+                                let bold: Vec<Range<usize>> = a.es_bold.iter().map(|r| r.start + shift..r.end + shift).collect();
+                                ui.label(marked_label(&format!("+ {}", a.es), &bold, 18.0, Color32::GRAY));
                                 if self.show_ru {
-                                    ui.label(RichText::new(&a.ru).size(14.0).color(Color32::from_gray(120)));
+                                    ui.label(marked_label(&a.ru, &a.ru_bold, 14.0, Color32::from_gray(120)));
                                 }
                             }
                         });

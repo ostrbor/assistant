@@ -101,6 +101,7 @@ fn main() -> Result<()> {
         "Assistant",
         options,
         Box::new(move |cc| {
+            ui::install_fonts(&cc.egui_ctx);
             let shared = state::Shared::new(Some(cc.egui_ctx.clone()));
             // A single folder, or one given via --topic, is selected automatically.
             let auto = topic_arg.or_else(|| (topics.len() == 1).then(|| topics[0].clone()));
