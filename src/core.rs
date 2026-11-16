@@ -6,7 +6,7 @@ use crate::state::{HintStatus, Shared, Speaker};
 use crate::usage::{Call, Outcome, Prices, Purpose, UsageMeter};
 use crate::{audio, hint, realtime};
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -49,9 +49,12 @@ pub struct Core {
     pub llm: Llm,
     /// Paid requests of the current session (for the cost report).
     pub usage: Arc<UsageMeter>,
-    pub prep: Mutex<Option<AbortHandle>>,
-    /// The short wait after the other person's last phrase, before the automatic hint starts.
-    pub auto_timer: Mutex<Option<AbortHandle>>,
+    /// Hint requests that are running; they never wait for or cancel each other.
+    pub prep: Mutex<Vec<AbortHandle>>,
+    /// Number of the last hint request started (they are numbered in the order they start).
+    pub hint_seq: AtomicU64,
+    /// How many hint requests are running now.
+    pub hint_runs: AtomicUsize,
     /// Debug record of the current Listen session (text + audio).
     pub rec: Mutex<Option<Arc<SessionLog>>>,
 }
@@ -64,7 +67,7 @@ impl Core {
             audio::threshold_set(&s.meters[Speaker::Them.idx()].threshold, cfg.transcribe.silence_threshold);
             audio::threshold_set(&s.meters[Speaker::Me.idx()].threshold, cfg.transcribe.mic_silence_threshold);
         });
-        Self { cfg, shared, index: RwLock::new(None), llm, usage, prep: Mutex::new(None), auto_timer: Mutex::new(None), rec: Mutex::new(None) }
+        Self { cfg, shared, index: RwLock::new(None), llm, usage, prep: Mutex::new(Vec::new()), hint_seq: AtomicU64::new(0), hint_runs: AtomicUsize::new(0), rec: Mutex::new(None) }
     }
 
     /// The record of the current session, if one is open.
@@ -72,16 +75,10 @@ impl Core {
         self.rec.lock().unwrap().clone()
     }
 
-    /// Stops a hint that is still being prepared or streamed.
+    /// Stops every hint that is still being prepared or streamed (the dialog was cleared or the
+    /// documents changed, so those hints are no longer wanted).
     pub fn cancel_hint(&self) {
-        if let Some(h) = self.prep.lock().unwrap().take() {
-            h.abort();
-        }
-    }
-
-    /// Cancels the wait that would start an automatic hint.
-    pub fn cancel_auto_timer(&self) {
-        if let Some(h) = self.auto_timer.lock().unwrap().take() {
+        for h in self.prep.lock().unwrap().drain(..) {
             h.abort();
         }
     }
@@ -119,11 +116,9 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
                 Some(Cmd::Clear) => {
                     // Stop a hint that is still streaming, or it would reappear.
                     core.cancel_hint();
-                    core.cancel_auto_timer();
                     core.shared.update(|s| {
                         s.segments.clear();
-                        s.hint = None;
-                        s.hint_status = HintStatus::Idle;
+                        s.clear_hints();
                         s.error = None;
                     });
                 }
@@ -375,9 +370,8 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
             r.cost(c);
         }
     }
-    core.cancel_auto_timer();
     core.shared.update(|s| {
-        if s.hint_status != HintStatus::Writing {
+        if s.hint_status != HintStatus::Writing && s.hint_status != HintStatus::Checking {
             s.hint_status = HintStatus::Idle;
         }
         if cost.is_some() {
@@ -394,23 +388,17 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
     });
 }
 
-/// The other person started talking: the wait for their turn to end starts over, and an automatic
-/// hint that has not shown anything yet is dropped (it was made from an unfinished turn).
+/// The other person started talking. Hints in progress are left alone: an answer that is already
+/// being written is never thrown away because they went on talking.
 fn on_them_speaking(core: &Arc<Core>) {
     if !core.cfg.hint_auto {
         return;
     }
-    core.cancel_auto_timer();
-    let mut dropped = false;
     core.shared.update(|s| {
-        if s.hint_status != HintStatus::Writing {
-            dropped = s.hint_status == HintStatus::Checking;
+        if matches!(s.hint_status, HintStatus::Idle | HintStatus::NoQuestion | HintStatus::Error(_)) {
             s.hint_status = HintStatus::Listening;
         }
     });
-    if dropped {
-        core.cancel_hint();
-    }
 }
 
 fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
@@ -462,23 +450,15 @@ fn on_completed(core: &Arc<Core>, item_id: &str, stt: Option<SttTiming>) {
         });
     });
 
-    // Their turn may be over: after a short quiet time ask the model whether it was a question.
-    // Any new speech from them (`on_them_speaking`) cancels the wait.
+    // After every phrase of theirs, with no waiting for silence: the model sees the hint on screen
+    // and the whole recent talk, and decides whether to keep, refine or replace the hint.
     if core.cfg.hint_auto {
         core.shared.update(|s| {
             if s.hint_status != HintStatus::Writing {
                 s.hint_status = HintStatus::Checking;
             }
         });
-        let core2 = core.clone();
-        let delay = std::time::Duration::from_millis(core.cfg.hint_auto_delay_ms);
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            hint::auto(&core2);
-        });
-        if let Some(old) = core.auto_timer.lock().unwrap().replace(task.abort_handle()) {
-            old.abort();
-        }
+        hint::auto(core);
     }
 }
 
@@ -515,12 +495,10 @@ fn select_topic(core: &Arc<Core>, topic: String) {
                 *core2.index.write().unwrap() = Some(Arc::new(index));
                 // A hint prepared from the previous folder is no longer valid.
                 core2.cancel_hint();
-                core2.cancel_auto_timer();
                 core2.shared.update(|s| {
                     s.topic = Some(topic.clone());
                     s.topic_loading = false;
-                    s.hint = None;
-                    s.hint_status = HintStatus::Idle;
+                    s.clear_hints();
                     s.docs_report = Some(crate::state::DocsReport { files, chunks: n });
                     if n == 0 {
                         s.error = Some(format!("No text found in {topic} (scanned PDFs are not supported)"));

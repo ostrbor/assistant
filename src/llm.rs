@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -118,7 +119,7 @@ impl Llm {
         let (tx, mut rx) = mpsc::unbounded_channel::<(usize, StreamEv)>();
         let winner_idx = Arc::new(AtomicUsize::new(NO_WINNER));
         let input_chars = messages.to_string().len();
-        let handles: Vec<_> = models
+        let handles = AbortAll(models
             .iter()
             .enumerate()
             .map(|(i, m)| {
@@ -143,7 +144,7 @@ impl Llm {
                     }
                 })
             })
-            .collect();
+            .collect());
         drop(tx);
 
         let (mut winner, mut text, mut failed) = (None, String::new(), 0);
@@ -156,7 +157,7 @@ impl Llm {
                     if winner.is_none() {
                         winner = Some(i);
                         winner_idx.store(i, Ordering::Relaxed);
-                        for (j, h) in handles.iter().enumerate() {
+                        for (j, h) in handles.0.iter().enumerate() {
                             if j != i {
                                 h.abort();
                             }
@@ -180,10 +181,21 @@ impl Llm {
                 }
             }
         };
-        for h in &handles {
+        // `handles` aborts every request that is still running when it is dropped here, and also
+        // when this future is dropped (cancelled) before it gets here.
+        result
+    }
+}
+
+/// Aborts its tasks when dropped. A dropped `JoinHandle` only detaches the task, so without this
+/// the requests of a cancelled hint would keep streaming (and be paid for) to the end.
+struct AbortAll(Vec<JoinHandle<()>>);
+
+impl Drop for AbortAll {
+    fn drop(&mut self) {
+        for h in &self.0 {
             h.abort();
         }
-        result
     }
 }
 
@@ -313,6 +325,31 @@ mod tests {
             tokens: None,
             outcome: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_stops_the_tasks() {
+        struct Flag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Flag(stopped.clone());
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        drop(AbortAll(vec![task]));
+        for _ in 0..50 {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(stopped.load(Ordering::Relaxed), "the task was left running");
     }
 
     #[test]

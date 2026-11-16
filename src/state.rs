@@ -48,7 +48,46 @@ pub struct Hint {
     pub done: bool,
     pub sources: Vec<String>,
     pub started: Option<Instant>,
+    /// The hint replaced an earlier one for the same question because Them added something.
+    pub updated: bool,
 }
+
+/// What the model decided about an automatic request, from the first line of its answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// Nothing new: the hint on screen still applies (or there is nothing to answer).
+    Keep,
+    /// The same question as the hint on screen, but the answer changes with what Them added.
+    Update,
+    /// A different question: the hint on screen moves to the earlier ones.
+    New,
+}
+
+impl Verdict {
+    /// Reads the marker on the first line of a (possibly still streaming) answer; `None` while it
+    /// is not known yet. An answer that starts with the old `SRC:`/`Q:`/`ES:` lines counts as `New`.
+    pub fn parse(raw: &str) -> Option<Verdict> {
+        let first = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+        let word: String = first.chars().take_while(|c| c.is_alphabetic()).collect::<String>().to_uppercase();
+        match word.as_str() {
+            "KEEP" | "NONE" => Some(Verdict::Keep),
+            "UPDATE" => Some(Verdict::Update),
+            "NEW" | "SRC" | "Q" | "ES" => Some(Verdict::New),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Keep => "KEEP",
+            Verdict::Update => "UPDATE",
+            Verdict::New => "NEW",
+        }
+    }
+}
+
+/// How many replaced hints are kept under the current one.
+pub const PREV_HINTS: usize = 3;
 
 impl Hint {
     /// Parses streamed text in the format `SRC: DOCS|OWN / Q: … / ES: … / RU: …`.
@@ -75,11 +114,6 @@ impl Hint {
         self.own = src.trim().to_uppercase().starts_with("OWN");
     }
 
-    /// The model answered `NONE`: there was no question to answer.
-    pub fn is_none(&self) -> bool {
-        self.es.is_empty() && self.raw.trim_start().to_uppercase().starts_with("NONE")
-    }
-
     /// The parsed text has something worth showing.
     pub fn has_content(&self) -> bool {
         !self.es.is_empty() || !self.question.is_empty()
@@ -91,13 +125,13 @@ impl Hint {
 pub enum HintStatus {
     #[default]
     Idle,
-    /// The other person is speaking (an automatic hint will follow the turn).
+    /// The other person is speaking (an automatic hint is asked after each of their phrases).
     Listening,
-    /// The turn ended; waiting a moment in case they go on, then asking the model.
+    /// A phrase ended; the model is deciding whether the hint needs to change.
     Checking,
     /// The model is writing the hint.
     Writing,
-    /// The model found no question in the last phrases.
+    /// The model found nothing new in the last phrases: the hint on screen still applies.
     NoQuestion,
     Error(String),
 }
@@ -166,12 +200,27 @@ pub struct AppState {
     pub log_path: Option<std::path::PathBuf>,
     /// Hint currently shown to the user.
     pub hint: Option<Hint>,
+    /// Hints that were replaced by a different question, newest first.
+    pub hint_prev: Vec<Hint>,
+    /// The hint request that owns the screen (requests are numbered in the order they start).
+    pub hint_owner: u64,
+    /// The newest request that answered KEEP: older requests that come late must not replace the screen.
+    pub hint_kept: u64,
     /// What the hint machinery is doing right now (shown above the hint).
     pub hint_status: HintStatus,
     /// Document folders (subfolders of docs_dir) and the selected one.
     pub topics: Vec<String>,
     pub topic: Option<String>,
     pub topic_loading: bool,
+}
+
+impl AppState {
+    /// Empties the hint panel (the dialog was cleared or the documents changed).
+    pub fn clear_hints(&mut self) {
+        self.hint = None;
+        self.hint_prev.clear();
+        self.hint_status = HintStatus::Idle;
+    }
 }
 
 #[derive(Clone)]
@@ -199,7 +248,7 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
-    use super::Hint;
+    use super::{Hint, Verdict};
 
     #[test]
     fn unprefixed_text_is_kept_in_raw() {
@@ -224,12 +273,28 @@ mod tests {
     }
 
     #[test]
-    fn none_answer_is_detected() {
+    fn verdict_is_read_from_the_first_line() {
+        assert_eq!(Verdict::parse("KEEP"), Some(Verdict::Keep));
+        assert_eq!(Verdict::parse("\n keep."), Some(Verdict::Keep));
+        assert_eq!(Verdict::parse("NONE"), Some(Verdict::Keep));
+        assert_eq!(Verdict::parse("UPDATE\nSRC: DOCS\nQ: x"), Some(Verdict::Update));
+        assert_eq!(Verdict::parse("NEW\nSRC: OWN"), Some(Verdict::New));
+        // Old format without a marker.
+        assert_eq!(Verdict::parse("SRC: OWN\nQ: x"), Some(Verdict::New));
+        // Not known yet while the first word is still arriving, or when the model ignores the format.
+        assert_eq!(Verdict::parse(""), None);
+        assert_eq!(Verdict::parse("UPD"), None);
+        assert_eq!(Verdict::parse("Tengo cinco años"), None);
+    }
+
+    #[test]
+    fn marker_line_does_not_leak_into_the_hint() {
         let mut h = Hint::default();
-        h.apply_raw("NONE");
-        assert!(h.is_none() && !h.has_content());
-        h.apply_raw("SRC: OWN\nQ: x\nES: hola\nRU: привет");
-        assert!(!h.is_none() && h.has_content());
+        h.apply_raw("UPDATE\nSRC: OWN\nQ: Что такое тавтология?\nES: Es siempre verdadera.\nRU: Всегда истинна.");
+        assert!(h.own && h.has_content());
+        assert_eq!((h.question.as_str(), h.es.as_str()), ("Что такое тавтология?", "Es siempre verdadera."));
+        h.apply_raw("KEEP");
+        assert!(!h.has_content());
     }
 
     #[test]

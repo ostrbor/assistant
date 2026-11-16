@@ -12,9 +12,6 @@ pub struct Config {
     /// Prepare and show a hint by itself after every turn of the other person.
     #[serde(default = "default_true")]
     pub hint_auto: bool,
-    /// Quiet time after the other person's last phrase before the automatic hint starts.
-    #[serde(default = "default_hint_auto_delay_ms")]
-    pub hint_auto_delay_ms: u64,
     pub transcribe: Transcribe,
     pub llm: Llm,
     /// Overrides of the built-in prices used in the session cost report, by model name.
@@ -78,10 +75,6 @@ fn default_silence_threshold() -> f64 {
 
 fn default_mic_silence_threshold() -> f64 {
     500.0
-}
-
-fn default_hint_auto_delay_ms() -> u64 {
-    1200
 }
 
 fn default_hint_chunks() -> usize {

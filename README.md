@@ -2,10 +2,10 @@
 
 A small desktop window for Linux that helps you follow a Spanish-language call (Zoom, Google Meet or anything else that plays through your speakers):
 
-- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with a Russian translation under each finished sentence. Your own speech appears too, marked `Me:` and without translation. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
+- **Live subtitles.** Press *Listen* and the other person's speech appears as Spanish text within about a second, with a Russian translation under each finished sentence. Your own speech is transcribed too (the hints know what you already said) but is hidden by default; show it in the ☰ menu (*Show my speech*). The translation can be hidden there as well (*Russian translation*). Both settings are remembered. Press *Stop* and nothing is captured or sent anywhere, so you only pay while it is on. Silence is not sent either.
 - **Answer hints.** Press *Hint* and the app finds the latest question in the last ~60 seconds of the call, looks it up in your own PDF documents, and writes a 2–3 sentence answer in very simple Spanish (A1–A2) with a Russian translation. Because it also sees what you already said, it does not answer a question you have just answered, and suggests a continuation instead. The hint also appears by itself: ~1.2 s after the other person stops talking, the model checks whether they asked something and, if so, the hint streams into the panel. A status line above the hint says what is happening (*They are speaking…*, *Checking whether that was a question…*, *Writing the hint…*, *No question in what they just said*), so you know whether to wait or press *Hint*.
 
-The window stays on top of other windows. The other person is captured from what plays through the speakers, you from your default microphone. **Use headphones**: through speakers, their voice leaks into your microphone and shows up as `Me:` lines. To turn the microphone off, set `capture_mic = false`.
+The window stays on top of other windows. The other person is captured from what plays through the speakers, you from your default microphone. **Use headphones**: through speakers, their voice leaks into your microphone and ends up in your own speech (visible with *Show my speech*, and it confuses the hints). To turn the microphone off, set `capture_mic = false`.
 
 ## How it works
 
@@ -105,7 +105,7 @@ cargo run --release -- --topic project_x     # preselect a document folder
 | **Listen / Stop** (`L`) | Start or stop capturing and transcribing. Nothing is sent while stopped. |
 | **Hint** (`Space` or `H`) | Get a hint right now (or a new one); hints also appear by themselves after each question. |
 | **Docs folder** (drop-down in the bottom row) | Choose which folder under `docs/` to answer from. You can switch at any time; the index rebuilds in a moment. |
-| **☰ menu** | *Rescan docs* after adding a folder, the document report, *Audio…*, *Open log*, and *Clear dialog* (clears the transcript, hint and errors). A coloured dot on ☰ means some documents have problems. |
+| **☰ menu** | *Rescan docs* after adding a folder, the document report, *Show my speech* (off by default), *Russian translation* (on by default), *Audio…*, *Open log*, and *Clear dialog* (clears the transcript, hint and errors). A coloured dot on ☰ means some documents have problems. |
 
 The keys work while the window is focused and no menu is open. The window is a narrow column meant to sit right under the webcam; the hint is at the very top, the dialog below it, the controls at the bottom, and nothing on screen moves or pulses.
 
@@ -125,8 +125,7 @@ Everything is in `config.toml`:
 | `hint_window_secs` | How much recent speech the hint generator sees (default 60). |
 | `hint_chunks` | How many of the best matching excerpts of your documents the hint generator sees (default 8, each up to 200 words). |
 | `hint_max_age_secs` | A hint on screen older than this is greyed out (default 20). |
-| `hint_auto` | `true` (default) shows a hint by itself after each turn of the other person; `false` means only the *Hint* button. |
-| `hint_auto_delay_ms` | Quiet time after the other person's last phrase before the automatic hint starts (default 1200). |
+| `hint_auto` | `true` (default) keeps the hint up to date by itself: after every phrase of the other person the model keeps, refines or replaces it; `false` means only the *Hint* button. |
 | `[transcribe] api_key` | OpenAI API key. If empty, the variable named in `api_key_env` is used. |
 | `[llm] api_key` | Key of the LLM endpoint (Hugging Face token by default). If empty, the variable named in `api_key_env` is used. |
 | `[transcribe] model, language` | Realtime transcription model and the spoken language. |
@@ -196,7 +195,7 @@ Notes:
 
 - **No subtitles, `test.wav` is silent.** The app records the monitor of the *default* output device. Make sure Zoom plays through the default output (check with `pactl get-default-sink`) or change the default in your sound settings.
 - **Your own voice is not transcribed.** Check `capture_mic` and `pactl get-default-source`; if the level is low, lower `mic_silence_threshold`. A missing microphone shows `Microphone lost, retrying…` while the speaker stream keeps working.
-- **The other person's words appear as `Me:`.** Their voice leaks from the speakers into your microphone. Use headphones.
+- **The other person's words appear in your own speech** (with *Show my speech* on). Their voice leaks from the speakers into your microphone. Use headphones.
 - **Subtitles cut off quiet speech, or the stream never goes quiet.** Tune `silence_threshold` / `mic_silence_threshold`.
 - **`LLM timed out`.** The provider gave no first token within 15 s (or went quiet for 20 s). Press *Hint* again or check the provider.
 - **`API key missing …` / `OpenAI API key is not set`.** Put the key into `config.toml` (`[transcribe] api_key`) and restart, or export `OPENAI_API_KEY` in the shell that launches the app.

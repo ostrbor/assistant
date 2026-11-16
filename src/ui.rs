@@ -17,11 +17,27 @@ pub struct App {
     report_seen: Option<(Option<String>, usize, usize)>,
     /// A right-click on selected text asked to copy it: replay Ctrl+C on the next frame.
     pending_copy: bool,
+    /// Show my own speech in the dialog (off: it is only context for hints).
+    show_me: bool,
+    /// Show the Russian translations.
+    show_ru: bool,
 }
 
 impl App {
-    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration) -> Self {
-        Self { shared, cmd_tx, hint_max_age, to_bottom: false, show_report: false, show_audio: false, report_seen: None, pending_copy: false }
+    pub fn new(shared: Shared, cmd_tx: UnboundedSender<Cmd>, hint_max_age: Duration, storage: Option<&dyn eframe::Storage>) -> Self {
+        let get = |key: &str, default: bool| storage.and_then(|s| eframe::get_value(s, key)).unwrap_or(default);
+        Self {
+            shared,
+            cmd_tx,
+            hint_max_age,
+            to_bottom: false,
+            show_report: false,
+            show_audio: false,
+            report_seen: None,
+            pending_copy: false,
+            show_me: get("show_me", false),
+            show_ru: get("show_ru", true),
+        }
     }
 
     fn send(&self, c: Cmd) {
@@ -132,6 +148,11 @@ fn status_icon(ui: &mut egui::Ui, kind: StatusIcon, color: Color32) -> egui::Res
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "show_me", &self.show_me);
+        eframe::set_value(storage, "show_ru", &self.show_ru);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if std::mem::take(&mut self.pending_copy) {
             ctx.input_mut(|i| i.events.push(egui::Event::Copy));
@@ -144,6 +165,7 @@ impl eframe::App for App {
             error,
             conn_error,
             hint,
+            hint_prev,
             hint_status,
             topics,
             topic,
@@ -154,6 +176,7 @@ impl eframe::App for App {
             monitoring,
             cost_report,
             cost_open,
+            ..
         } = self.shared.read(AppState::clone);
 
         // Keys (window focused, no menu open): Space / H = hint, L = listen / stop.
@@ -258,6 +281,9 @@ impl eframe::App for App {
                                 ui.weak("Log: terminal");
                             }
                         }
+                        ui.separator();
+                        ui.checkbox(&mut self.show_me, "Show my speech");
+                        ui.checkbox(&mut self.show_ru, "Russian translation");
                         ui.separator();
                         if ui.button("Clear dialog").clicked() {
                             self.to_bottom = true;
@@ -364,10 +390,10 @@ impl eframe::App for App {
             }
             // (icon, word, tooltip, color); static icons only, no spinners.
             let status_info: Option<(StatusIcon, &str, String, Color32)> = match &hint_status {
-                HintStatus::Listening => Some((StatusIcon::Bars, "speaking", "They are speaking: a hint will follow their turn".into(), accent)),
-                HintStatus::Checking => Some((StatusIcon::Dot, "checking", "Checking whether that was a question…".into(), accent)),
+                HintStatus::Listening => Some((StatusIcon::Bars, "speaking", "They are speaking: the hint is checked after each of their phrases".into(), accent)),
+                HintStatus::Checking => Some((StatusIcon::Dot, "checking", "Checking whether the hint still fits what they said…".into(), accent)),
                 HintStatus::Writing => Some((StatusIcon::Dot, "writing", "Writing the hint…".into(), accent)),
-                HintStatus::NoQuestion => Some((StatusIcon::Dash, "no question", "No question in what they just said. Press Hint to get an answer anyway.".into(), Color32::GRAY)),
+                HintStatus::NoQuestion => Some((StatusIcon::Dash, "unchanged", "Nothing new in what they just said: the hint still applies. Press Hint to get an answer anyway.".into(), Color32::GRAY)),
                 HintStatus::Error(e) => Some((StatusIcon::Warn, "error", e.clone(), Color32::LIGHT_RED)),
                 HintStatus::Idle => None,
             };
@@ -392,6 +418,9 @@ impl eframe::App for App {
                         if let Some(a) = age {
                             ui.label(RichText::new(age_text(a)).size(13.0).weak()).on_hover_text("How long ago this hint was started");
                         }
+                        if hint.as_ref().is_some_and(|h| h.updated) {
+                            ui.label(RichText::new("updated").size(13.0).color(accent)).on_hover_text("Refined: they added details to the same question");
+                        }
                         if let Some((icon, word, tip, color)) = &status_info {
                             let r = ui.label(RichText::new(*word).size(13.0).color(*color));
                             status_icon(ui, *icon, *color).on_hover_text(tip);
@@ -401,7 +430,8 @@ impl eframe::App for App {
                 });
                 ui.add_space(2.0);
             }
-            egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| match &hint {
+            egui::ScrollArea::vertical().id_salt("hint_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                match &hint {
                 None => {}
                 Some(h) => {
                     let stale = age.is_some_and(|a| a > self.hint_max_age) && h.done;
@@ -426,9 +456,31 @@ impl eframe::App for App {
                                 .desired_width(f32::INFINITY)
                                 .frame(false),
                         );
-                        copy_menu(&r, &format!("{}\n{}", h.es, h.ru), &mut self.pending_copy);
-                        let r = ui.label(RichText::new(&h.ru).size(18.0).color(ru_color));
-                        copy_menu(&r, &h.ru, &mut self.pending_copy);
+                        if self.show_ru {
+                            copy_menu(&r, &format!("{}\n{}", h.es, h.ru), &mut self.pending_copy);
+                            let r = ui.label(RichText::new(&h.ru).size(18.0).color(ru_color));
+                            copy_menu(&r, &h.ru, &mut self.pending_copy);
+                        } else {
+                            copy_menu(&r, &h.es, &mut self.pending_copy);
+                        }
+                    }
+                }
+                }
+                // Hints that were replaced by a different question stay readable, collapsed.
+                if !hint_prev.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Earlier").size(13.0).weak());
+                    for (i, p) in hint_prev.iter().enumerate() {
+                        let title = if p.question.is_empty() { p.es.as_str() } else { p.question.as_str() };
+                        egui::CollapsingHeader::new(RichText::new(title).size(15.0).color(ui.visuals().weak_text_color())).id_salt(("earlier", i)).show(ui, |ui| {
+                            let r = ui.label(RichText::new(&p.es).size(20.0).color(Color32::GRAY));
+                            if self.show_ru {
+                                copy_menu(&r, &format!("{}\n{}", p.es, p.ru), &mut self.pending_copy);
+                                ui.label(RichText::new(&p.ru).size(15.0).color(Color32::from_gray(120)));
+                            } else {
+                                copy_menu(&r, &p.es, &mut self.pending_copy);
+                            }
+                        });
                     }
                 }
             });
@@ -441,6 +493,9 @@ impl eframe::App for App {
                     // The other person is what you read: large and bright, with its translation.
                     // Your own speech is only context: smaller, muted, never translated.
                     let me = seg.speaker == Speaker::Me;
+                    if me && !self.show_me {
+                        continue;
+                    }
                     if me {
                         // No "Me:" prefix: an indent with a thin bar on the left marks your own lines.
                         let mut es = RichText::new(&seg.es).size(17.0).color(Color32::from_gray(125));
@@ -462,11 +517,13 @@ impl eframe::App for App {
                         }
                         let r = ui.label(es);
                         let whole = match &seg.ru {
-                            Some(ru) => format!("{}\n{ru}", seg.es),
-                            None => seg.es.clone(),
+                            Some(ru) if self.show_ru => format!("{}\n{ru}", seg.es),
+                            _ => seg.es.clone(),
                         };
                         copy_menu(&r, &whole, &mut self.pending_copy);
-                        if let Some(ru) = &seg.ru {
+                        if !self.show_ru {
+                            // No translation line at all.
+                        } else if let Some(ru) = &seg.ru {
                             let r = ui.label(RichText::new(ru).size(17.0).color(Color32::from_rgb(150, 190, 235)));
                             copy_menu(&r, &whole, &mut self.pending_copy);
                         } else if !seg.partial {

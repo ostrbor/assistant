@@ -119,7 +119,7 @@ fn main() -> Result<()> {
                 let _ = cmd_tx.send(core::Cmd::SelectTopic(t));
             }
             handle.spawn(core::run(core, cmd_rx));
-            Ok(Box::new(ui::App::new(shared, cmd_tx, hint_max_age)))
+            Ok(Box::new(ui::App::new(shared, cmd_tx, hint_max_age, cc.storage)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))?;

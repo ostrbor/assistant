@@ -1,8 +1,9 @@
 use crate::core::Core;
 use crate::record::HintTiming;
-use crate::state::{Hint, HintStatus, Segment, Shared, Speaker};
+use crate::state::{Hint, HintStatus, PREV_HINTS, Segment, Shared, Speaker, Verdict};
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const SYSTEM: &str = "You help the user answer questions in a Spanish-language video call. The user speaks Spanish only at A1-A2 level. \
@@ -15,15 +16,19 @@ If they do not contain it (or only a part of it), NEVER say that you have no inf
 For personal facts about the user that are not in the excerpts (employers, dates, numbers, names, years of experience) do not invent specifics: give a plain generic answer and write 'SRC: OWN'. \
 Output exactly four lines and nothing else:\nSRC: <DOCS or OWN>\nQ: <the question, short, in Russian>\nES: <the answer in Spanish>\nRU: <Russian translation of the answer>";
 
-/// Added to the prompt of automatic hints, which fire after every turn of the other person.
-const AUTO_RULE: &str = "\nThis request is automatic, made after every turn of Them. Look at the latest turn of Them: all 'Them:' lines after the last 'Me:' line. \
-If that turn contains a question or request addressed to the user that the user has not answered yet, answer it, even if Them added an explanation, example or comment after the question. \
-Output exactly the single word NONE and nothing else only when the whole turn has no such question (small talk, thanks, an acknowledgement, or they are still explaining before asking anything).";
+/// Added to the prompt of automatic hints. They are asked after every phrase of Them, and the model
+/// sees the hint that is on screen now, so it decides whether that hint still fits.
+const AUTO_RULE: &str = "\nThis request is automatic: it is made after every phrase of Them, and the user is already reading the 'Current hint on screen' (if there is one). \
+Compare the latest phrases of Them (all 'Them:' lines after the last 'Me:' line) with the current hint and start your answer with exactly one word on its own first line:\n\
+KEEP - nothing to change. Use it when the latest phrases are filler, thanks, an acknowledgement, small talk or talk to somebody else; when Them only repeat or rephrase the question the current hint already answers, without new information; when Them are still explaining and have not asked anything yet; or when the user has already fully answered. Output only the word KEEP and nothing else.\n\
+UPDATE - the latest phrases are about the same question as the current hint, but they add an explanation, a narrowing, an example or a rephrasing that makes a different or better answer. Write UPDATE, then the four lines below, with an answer to the whole question including the new details.\n\
+NEW - Them asked a different question or made a different request that the user has not answered. Write NEW, then the four lines below. Use NEW too when there is no current hint and a question is unanswered.\n\
+When in doubt between KEEP and UPDATE, choose UPDATE; when in doubt between UPDATE and NEW, choose NEW. Never answer KEEP when there is an unanswered question and no current hint.";
 
 /// How a hint was started.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// After a turn of the other person, without the user asking; the model may answer NONE.
+    /// After a phrase of the other person, without the user asking; the model may answer KEEP.
     Auto,
     /// The Hint button: always produces a hint.
     Requested,
@@ -69,32 +74,41 @@ pub fn ask(core: &Arc<Core>) {
     generate(core, Mode::Requested);
 }
 
-/// After a turn of the other person: the model decides whether there is a question to answer.
+/// After a phrase of the other person: the model decides whether the hint on screen still fits.
+/// Requests never wait for each other and are never cancelled by new speech.
 pub fn auto(core: &Arc<Core>) {
-    if !core.cfg.hint_auto {
-        return;
+    if core.cfg.hint_auto {
+        generate(core, Mode::Auto);
     }
-    // A hint the user is reading is still being written: do not cut it off.
-    if core.shared.read(|s| s.hint.as_ref().is_some_and(|h| !h.done)) {
-        return;
+}
+
+/// Counts a running request, however it ends (finished, failed or aborted).
+struct RunGuard(Arc<Core>);
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.0.hint_runs.fetch_sub(1, Ordering::Relaxed);
     }
-    generate(core, Mode::Auto);
 }
 
 fn generate(core: &Arc<Core>, mode: Mode) {
+    // Requests are numbered in the order they start; a late answer of an older one never wins.
+    let seq = core.hint_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    core.hint_runs.fetch_add(1, Ordering::Relaxed);
     let core2 = core.clone();
     let task = tokio::spawn(async move {
-        if let Err(e) = run(&core2, mode).await {
+        let _guard = RunGuard(core2.clone());
+        if let Err(e) = run(&core2, mode, seq).await {
             if let Some(r) = core2.rec() {
                 r.error(&format!("Hint: {e}"));
             }
-            core2.usage.event("hint_error", json!({ "requested": mode == Mode::Requested, "error": e.to_string() }));
+            core2.usage.event("hint_error", json!({ "seq": seq, "requested": mode == Mode::Requested, "error": e.to_string() }));
             core2.shared.update(|s| {
-                // Do not leave a half-written hint with a spinner.
-                match s.hint.as_mut() {
-                    Some(h) if !h.done && h.has_content() => h.done = true,
-                    Some(h) if !h.done => s.hint = None,
-                    _ => {}
+                // Do not leave a half-written hint with a spinner (only if it is this request's).
+                if s.hint_owner == seq
+                    && let Some(h) = s.hint.as_mut()
+                {
+                    h.done = true;
                 }
                 match mode {
                     Mode::Requested => {
@@ -106,29 +120,44 @@ fn generate(core: &Arc<Core>, mode: Mode) {
             });
         }
     });
-    if let Some(old) = core.prep.lock().unwrap().replace(task.abort_handle()) {
-        old.abort();
+    let mut prep = core.prep.lock().unwrap();
+    prep.retain(|h| !h.is_finished());
+    prep.push(task.abort_handle());
+}
+
+/// Sets the final status, unless other requests are still running (the last one to end sets it).
+fn settle(core: &Core, status: HintStatus) {
+    if core.hint_runs.load(Ordering::Relaxed) <= 1 {
+        core.shared.update(|s| s.hint_status = status);
     }
 }
 
-async fn run(core: &Arc<Core>, mode: Mode) -> anyhow::Result<()> {
+async fn run(core: &Arc<Core>, mode: Mode, seq: u64) -> anyhow::Result<()> {
     let index = core.index.read().unwrap().clone().ok_or_else(|| anyhow::anyhow!("select a document folder first"))?;
     let window = Duration::from_secs(core.cfg.hint_window_secs);
     let t0 = Instant::now();
-    let show = mode == Mode::Requested;
-    core.shared.update(|s| s.hint_status = if show { HintStatus::Writing } else { HintStatus::Checking });
-    core.usage.event("hint_start", json!({ "requested": show }));
+    let requested = mode == Mode::Requested;
+    core.shared.update(|s| {
+        if requested {
+            s.hint_status = HintStatus::Writing;
+        } else if s.hint_status != HintStatus::Writing {
+            s.hint_status = HintStatus::Checking;
+        }
+    });
+    core.usage.event("hint_start", json!({ "seq": seq, "requested": requested }));
     let lines = core.shared.read(|s| pick_lines(&s.segments, window));
     if lines.is_empty() {
         // Nothing has been said yet: say so in the hint panel, not as an error.
-        if show {
+        if requested {
             let raw = "Nothing has been said yet. Start the conversation, then press Hint.".to_string();
             core.shared.update(|s| s.hint = Some(Hint { raw, done: true, ..Default::default() }));
         }
-        core.shared.update(|s| s.hint_status = HintStatus::Idle);
+        settle(core, HintStatus::Idle);
         return Ok(());
     }
 
+    // What the user is reading now: an automatic request decides whether it still fits.
+    let current = if requested { None } else { core.shared.read(|s| s.hint.clone()).filter(Hint::has_content) };
     let transcript: Vec<String> = lines
         .iter()
         .map(|(sp, t)| format!("{}: {t}", if *sp == Speaker::Me { "Me" } else { "Them" }))
@@ -143,10 +172,16 @@ async fn run(core: &Arc<Core>, mode: Mode) -> anyhow::Result<()> {
         .copied()
         .unwrap_or(lines.last().unwrap().1.as_str());
     let all = if them.is_empty() { focus.to_string() } else { them.join(" ") };
+    let mut query = vec![(focus, 3.0), (all.as_str(), 1.0)];
+    // A bare "¿Es verdad?" or "¿y?" carries no topic: the current answer does, so a follow-up
+    // finds the same pages as the question it refers to.
+    if let Some(h) = &current {
+        query.push((h.es.as_str(), 1.5));
+    }
     let searched = Instant::now();
-    let found = index.search(&[(focus, 3.0), (&all, 1.0)], core.cfg.hint_chunks.max(1));
+    let found = index.search(&query, core.cfg.hint_chunks.max(1));
     let search = searched.elapsed();
-    core.usage.event("hint_search", json!({ "ms": search.as_millis() as u64, "chunks": found.len(), "lines": lines.len() }));
+    core.usage.event("hint_search", json!({ "seq": seq, "ms": search.as_millis() as u64, "chunks": found.len(), "lines": lines.len() }));
 
     let mut sources: Vec<String> = Vec::new();
     let mut excerpts = String::new();
@@ -157,40 +192,57 @@ async fn run(core: &Arc<Core>, mode: Mode) -> anyhow::Result<()> {
             sources.push(tag);
         }
     }
-    let user = format!("Transcript (latest last):\n{}\n\nDocument excerpts:\n{}", transcript.join("\n"), excerpts);
+    let screen = match (&current, requested) {
+        (_, true) => String::new(),
+        (Some(h), _) => format!("\n\nCurrent hint on screen:\nQ: {}\nES: {}", h.question, h.es),
+        (None, _) => "\n\nCurrent hint on screen: none".to_string(),
+    };
+    let user = format!("Transcript (latest last):\n{}{screen}\n\nDocument excerpts:\n{}", transcript.join("\n"), excerpts);
     let messages = json!([{ "role": "system", "content": system_prompt(mode) }, { "role": "user", "content": user }]);
 
+    let had_current = current.is_some();
     let mut hint = Hint { sources, started: Some(Instant::now()), ..Default::default() };
-    publish(&core.shared, &hint, mode);
-
     let mut first_token = None;
     let streamed = core
         .llm
         .hedged_stream(&core.cfg.llm.hint_models, messages, |raw| {
             first_token.get_or_insert_with(|| t0.elapsed());
             hint.apply_raw(raw);
-            publish(&core.shared, &hint, mode);
+            // Nothing is shown before the model has said what it is (KEEP never shows anything).
+            let verdict = if requested { Some(Verdict::New) } else { Verdict::parse(raw) };
+            if let Some(v @ (Verdict::New | Verdict::Update)) = verdict
+                && hint.has_content()
+            {
+                hint.updated = v == Verdict::Update && had_current;
+                place(&core.shared, seq, mode, v, &hint);
+            }
         })
         .await?;
     hint.apply_raw(&streamed.text);
     hint.done = true;
-    if hint.is_none() && !show {
-        // No question in what they said: keep the hint that is on screen and say so.
-        let last = lines.iter().rev().find(|(sp, _)| *sp == Speaker::Them).map_or("", |(_, t)| t.as_str());
-        core.shared.update(|s| s.hint_status = HintStatus::NoQuestion);
-        core.usage.event("hint_none", json!({ "model": streamed.model, "total_ms": t0.elapsed().as_millis() as u64, "last": last }));
+    let last = lines.iter().rev().find(|(sp, _)| *sp == Speaker::Them).map_or("", |(_, t)| t.as_str());
+    // A reply that ignores the format is shown as it is, like a new hint.
+    let verdict = if requested { Verdict::New } else { Verdict::parse(&streamed.text).unwrap_or(Verdict::New) };
+    if verdict == Verdict::Keep {
+        core.shared.update(|s| s.hint_kept = s.hint_kept.max(seq));
+        settle(core, HintStatus::NoQuestion);
+        core.usage.event("hint_keep", json!({ "seq": seq, "model": streamed.model, "total_ms": t0.elapsed().as_millis() as u64, "last": last }));
         if let Some(r) = core.rec() {
-            r.note(&format!("HINT none · {} · {:.1} s · no question in: {last}", streamed.model, t0.elapsed().as_secs_f64()));
+            r.note(&format!("HINT keep · {} · {:.1} s · nothing new after: {last}", streamed.model, t0.elapsed().as_secs_f64()));
         }
         return Ok(());
     }
-    publish(&core.shared, &hint, mode);
-    core.shared.update(|s| s.hint_status = HintStatus::Idle);
-    let timing = HintTiming { model: streamed.model, search, first_token, total: t0.elapsed() };
+    hint.updated = verdict == Verdict::Update && had_current;
+    let placed = place(&core.shared, seq, mode, verdict, &hint);
+    settle(core, HintStatus::Idle);
+    let timing = HintTiming { model: streamed.model, search, first_token, total: t0.elapsed(), verdict: verdict.label(), placed };
     core.usage.event(
         "hint_done",
         json!({
-            "requested": show,
+            "seq": seq,
+            "verdict": timing.verdict,
+            "placed": placed,
+            "requested": requested,
             "model": timing.model,
             "search_ms": search.as_millis() as u64,
             "first_token_ms": timing.first_token.map(|d| d.as_millis() as u64),
@@ -205,18 +257,37 @@ async fn run(core: &Arc<Core>, mode: Mode) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Puts the hint on screen. An automatic hint stays hidden (the previous one remains) until the
-/// model has written something, so a NONE answer never wipes the screen.
-fn publish(shared: &Shared, h: &Hint, mode: Mode) {
-    if mode == Mode::Auto && !h.has_content() && !h.done {
-        return;
-    }
+/// Puts the hint of request `seq` on screen if that request may own it; false if a newer request
+/// does. The first words of a NEW hint move the hint that was on screen to the earlier ones; an
+/// UPDATE replaces it in place.
+fn place(shared: &Shared, seq: u64, mode: Mode, verdict: Verdict, h: &Hint) -> bool {
+    let mut placed = false;
     shared.update(|s| {
+        let allowed = match mode {
+            // The user asked: it wins over everything that started before it.
+            Mode::Requested => seq >= s.hint_owner,
+            Mode::Auto => seq == s.hint_owner || (seq > s.hint_owner && seq > s.hint_kept),
+        };
+        if !allowed {
+            return;
+        }
+        if seq != s.hint_owner {
+            if (mode == Mode::Requested || verdict == Verdict::New)
+                && let Some(mut old) = s.hint.take().filter(Hint::has_content)
+            {
+                old.done = true;
+                s.hint_prev.insert(0, old);
+                s.hint_prev.truncate(PREV_HINTS);
+            }
+            s.hint_owner = seq;
+        }
         s.hint = Some(h.clone());
         if s.hint_status == HintStatus::Checking {
             s.hint_status = HintStatus::Writing;
         }
+        placed = true;
     });
+    placed
 }
 
 #[cfg(test)]
@@ -226,6 +297,66 @@ mod tests {
     fn seg(text: &str, age_secs: u64) -> Segment {
         let at = Instant::now().checked_sub(Duration::from_secs(age_secs)).expect("clock");
         Segment { item_id: text.into(), speaker: Speaker::Them, es: text.into(), ru: None, partial: false, at }
+    }
+
+    fn hint(es: &str) -> Hint {
+        Hint { question: format!("Q {es}"), es: es.into(), done: true, ..Default::default() }
+    }
+
+    fn screen(shared: &Shared) -> (String, Vec<String>) {
+        shared.read(|s| (s.hint.as_ref().map_or(String::new(), |h| h.es.clone()), s.hint_prev.iter().map(|h| h.es.clone()).collect()))
+    }
+
+    #[test]
+    fn new_hint_moves_the_old_one_down_and_update_replaces_in_place() {
+        let shared = Shared::new(None);
+        assert!(place(&shared, 1, Mode::Auto, Verdict::New, &hint("a")));
+        assert!(place(&shared, 2, Mode::Auto, Verdict::New, &hint("b")));
+        assert_eq!(screen(&shared), ("b".into(), vec!["a".into()]));
+        // The same request keeps streaming into the same slot.
+        assert!(place(&shared, 2, Mode::Auto, Verdict::New, &hint("b2")));
+        assert_eq!(screen(&shared), ("b2".into(), vec!["a".into()]));
+        // An update refines the hint without adding to the earlier ones.
+        assert!(place(&shared, 3, Mode::Auto, Verdict::Update, &hint("b3")));
+        assert_eq!(screen(&shared), ("b3".into(), vec!["a".into()]));
+        // Only the last few earlier hints are kept.
+        for (i, n) in ["c", "d", "e", "f"].iter().enumerate() {
+            place(&shared, 4 + i as u64, Mode::Auto, Verdict::New, &hint(n));
+        }
+        assert_eq!(screen(&shared).1.len(), PREV_HINTS);
+    }
+
+    #[test]
+    fn a_late_older_answer_never_replaces_a_newer_one() {
+        let shared = Shared::new(None);
+        assert!(place(&shared, 3, Mode::Auto, Verdict::New, &hint("new")));
+        assert!(!place(&shared, 2, Mode::Auto, Verdict::New, &hint("old")));
+        assert_eq!(screen(&shared), ("new".into(), vec![]));
+    }
+
+    #[test]
+    fn keep_blocks_older_requests_that_have_not_shown_anything() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &hint("a"));
+        shared.update(|s| s.hint_kept = 5);
+        // 4 started before the KEEP of 5 and has not claimed the screen yet.
+        assert!(!place(&shared, 4, Mode::Auto, Verdict::New, &hint("late")));
+        // A request that is already streaming is not cut off by a later KEEP.
+        place(&shared, 6, Mode::Auto, Verdict::New, &hint("b"));
+        shared.update(|s| s.hint_kept = 7);
+        assert!(place(&shared, 6, Mode::Auto, Verdict::New, &hint("b done")));
+        assert_eq!(screen(&shared).0, "b done");
+    }
+
+    #[test]
+    fn the_hint_button_wins_over_everything_that_started_before_it() {
+        let shared = Shared::new(None);
+        place(&shared, 1, Mode::Auto, Verdict::New, &hint("a"));
+        shared.update(|s| s.hint_kept = 5);
+        assert!(place(&shared, 4, Mode::Requested, Verdict::New, &hint("asked")));
+        assert_eq!(screen(&shared), ("asked".into(), vec!["a".into()]));
+        // An automatic request that started earlier and comes late is dropped.
+        assert!(!place(&shared, 3, Mode::Auto, Verdict::New, &hint("late")));
     }
 
     #[test]
