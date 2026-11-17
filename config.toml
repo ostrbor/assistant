@@ -23,6 +23,16 @@ api_key = ""
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o-transcribe"
 language = "es"
+# Live subtitles for the other person: their words appear while they are still speaking (about 2 s
+# after the sound), instead of after the phrase is over. Costs about $1 per hour of their speech
+# (gpt-4o-transcribe: about $0.36). The model above is then used only for your microphone.
+# Set to "" to go back to one model for both and the server's pause detection.
+live_model = "gpt-live-transcribe"
+# With the live model the app itself closes a phrase (that is when it is translated and a hint is
+# considered): after silence_ms of quiet, or, in a long monologue, at the first real dip (200 ms) in the sound after
+# max_phrase_secs; a phrase that never dips is cut at max_phrase_hard_secs.
+max_phrase_secs = 12
+max_phrase_hard_secs = 20
 # Frames quieter than this RMS level (16-bit samples) are treated as silence and not sent
 # Tune both thresholds visually in the Audio window (bottom bar), then copy the values here
 silence_threshold = 300

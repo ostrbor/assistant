@@ -1,5 +1,7 @@
 use crate::config::Transcribe;
+use crate::audio::{self, Threshold};
 use crate::core::{Ev, note};
+use crate::phrase::{Cut, PhraseCutter};
 use crate::record::SttTiming;
 use crate::state::{Segment, Shared, Speaker};
 use anyhow::{Result, anyhow, bail};
@@ -169,7 +171,8 @@ struct Conn<'a> {
 /// disabled by OpenAI: `beta_api_shape_disabled`).
 fn session_update(cfg: &Transcribe, speaker: Speaker) -> Value {
     let silence_ms = if speaker == Speaker::Me { cfg.mic_silence_ms } else { cfg.silence_ms };
-    let mut transcription = json!({ "model": cfg.model, "language": cfg.language });
+    let live = is_live(cfg, speaker);
+    let mut transcription = json!({ "model": cfg.model_for(speaker == Speaker::Them), "language": cfg.language });
     if !cfg.prompt.trim().is_empty() {
         transcription["prompt"] = json!(cfg.prompt.trim());
     }
@@ -180,10 +183,16 @@ fn session_update(cfg: &Transcribe, speaker: Speaker) -> Value {
             "audio": { "input": {
                 "format": { "type": "audio/pcm", "rate": crate::audio::RATE },
                 "transcription": transcription,
-                "turn_detection": { "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": silence_ms }
+                // The live model has no pause detection: the app commits each phrase itself (`PhraseCutter`).
+                "turn_detection": if live { Value::Null } else { json!({ "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": silence_ms }) }
             } }
         }
     })
+}
+
+/// The other person is transcribed by the live model, and the app cuts the phrases.
+fn is_live(cfg: &Transcribe, speaker: Speaker) -> bool {
+    speaker == Speaker::Them && cfg.live()
 }
 
 /// The text that tells the recognizer what to expect. A short utterance has little to go on, and
@@ -255,10 +264,22 @@ async fn run(
     let b64 = base64::engine::general_purpose::STANDARD;
     let audio_msg = |c: &[u8]| Message::Text(json!({ "type": "input_audio_buffer.append", "audio": b64.encode(c) }).to_string());
 
+    // Live mode: this task decides where a phrase ends (the server has no pause detection for the live model).
+    let live = is_live(cfg, speaker);
+    let mut cutter = PhraseCutter::new(Duration::from_millis(cfg.silence_ms), Duration::from_secs_f64(cfg.max_phrase_secs), Duration::from_secs_f64(cfg.max_phrase_hard_secs));
+    let threshold = shared.read(|s| s.meters[speaker.idx()].threshold.clone());
+    let mut clock = LiveClock::default();
+    // After the silence gate's hangover no frames come, but a pause still has to be noticed.
+    let mut tick = interval(Duration::from_millis(100));
+
     // Audio captured while we were disconnected goes first.
     while let Some(c) = backlog.pop_front() {
         send(&mut w, audio_msg(&c)).await?;
         note_sent(shared, speaker, c.len());
+        if live {
+            let cut = cutter.on_frame(Instant::now(), is_loud(&c, &threshold));
+            apply_cut(&mut w, cut, speaker, ev_tx, &mut clock).await?;
+        }
     }
 
     let mut ping = interval(PING_EVERY);
@@ -273,6 +294,14 @@ async fn run(
                 let Some(c) = chunk else { return Ok(()) };
                 send(&mut w, audio_msg(&c)).await?;
                 note_sent(shared, speaker, c.len());
+                if live {
+                    let cut = cutter.on_frame(Instant::now(), is_loud(&c, &threshold));
+                    apply_cut(&mut w, cut, speaker, ev_tx, &mut clock).await?;
+                }
+            }
+            _ = tick.tick(), if live => {
+                let cut = cutter.on_tick(Instant::now());
+                apply_cut(&mut w, cut, speaker, ev_tx, &mut clock).await?;
             }
             _ = ping.tick() => {
                 if last_rx.elapsed() > DEAD_AFTER {
@@ -284,7 +313,7 @@ async fn run(
                 last_rx = Instant::now();
                 shared.update(|s| s.meters[speaker.idx()].last_server_msg = Some(last_rx));
                 match msg {
-                    Some(Ok(Message::Text(t))) => match handle(&t, shared, ev_tx, speaker, &mut speeches)? {
+                    Some(Ok(Message::Text(t))) => match handle(&t, shared, ev_tx, speaker, &mut speeches, &mut clock)? {
                         Handled::Accepted => accepted = true,
                         Handled::Other => {}
                         Handled::ServerError { kind, message } => {
@@ -335,6 +364,8 @@ enum Handled {
 struct Speech {
     started_ms: Option<u64>,
     stopped_ms: Option<u64>,
+    /// Live mode: when the phrase began (the app's own clock; the server sends no `speech_started`).
+    started_at: Option<Instant>,
     /// When the end of the speech reached us.
     stopped_at: Option<Instant>,
     got_text: bool,
@@ -344,9 +375,62 @@ impl Speech {
     fn since_stop_ms(&self) -> Option<u64> {
         self.stopped_at.map(|t| t.elapsed().as_millis() as u64)
     }
+
+    fn since_start_ms(&self) -> Option<u64> {
+        self.started_at.map(|t| t.elapsed().as_millis() as u64)
+    }
+
+    /// How long the phrase lasted: from the server's voice detector, or from the app's own clock in live mode.
+    fn speech_secs(&self) -> Option<f64> {
+        self.started_ms
+            .zip(self.stopped_ms)
+            .map(|(a, b)| b.saturating_sub(a) as f64 / 1000.0)
+            .or_else(|| self.started_at.zip(self.stopped_at).map(|(a, b)| b.saturating_duration_since(a).as_secs_f64()))
+    }
 }
 
-fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker, speeches: &mut HashMap<String, Speech>) -> Result<Handled> {
+/// Live mode: the phrases the app has begun and closed, in order. The server numbers its items in
+/// the order of the commits, so the n-th `committed` event belongs to the n-th phrase here.
+#[derive(Default)]
+struct LiveClock {
+    /// The phrase being spoken now.
+    open: Option<Instant>,
+    /// Starts of the phrases whose `committed` event has not arrived yet.
+    starts: VecDeque<Instant>,
+    /// Moments of our `commit` messages whose `committed` event has not arrived yet.
+    commits: VecDeque<Instant>,
+}
+
+/// Does what the cutter decided: a local `speech_started`, or a `commit` and a local `speech_stopped`.
+async fn apply_cut<S>(w: &mut S, cut: Cut, speaker: Speaker, ev_tx: &UnboundedSender<Ev>, clock: &mut LiveClock) -> Result<()>
+where
+    S: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    let now = Instant::now();
+    match cut {
+        Cut::None => {}
+        Cut::Started => {
+            clock.open = Some(now);
+            clock.starts.push_back(now);
+            // The hint panel switches to "listening" on this event, as it did on the server's.
+            let _ = ev_tx.send(note(speaker, "STT", "speech_started", String::new(), json!({ "live": true })));
+        }
+        Cut::Commit(why) => {
+            send(w, Message::Text(json!({ "type": "input_audio_buffer.commit" }).to_string())).await?;
+            clock.commits.push_back(now);
+            let ms = clock.open.take().map(|t| now.saturating_duration_since(t).as_millis() as u64);
+            let _ = ev_tx.send(note(speaker, "STT", "speech_stopped", String::new(), json!({ "live": true, "reason": why.label(), "speech_ms": ms })));
+        }
+    }
+    Ok(())
+}
+
+/// Is this 100 ms frame above the silence threshold of the Audio window?
+fn is_loud(frame: &[u8], threshold: &Threshold) -> bool {
+    audio::rms(frame) >= audio::threshold_get(threshold)
+}
+
+fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Speaker, speeches: &mut HashMap<String, Speech>, clock: &mut LiveClock) -> Result<Handled> {
     let v: Value = serde_json::from_str(text)?;
     let item_id = format!("{}{}", speaker.id_prefix(), v["item_id"].as_str().unwrap_or_default());
     let ty = v["type"].as_str().unwrap_or_default();
@@ -371,13 +455,22 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
             timing("speech_stopped", json!({ "id": item_id, "audio_end_ms": ms, "speech_ms": sp.started_ms.zip(ms).map(|(a, b)| b.saturating_sub(a)) }));
         }
         "input_audio_buffer.committed" => {
-            let since = speeches.get(&item_id).and_then(Speech::since_stop_ms);
-            timing("committed", json!({ "id": item_id, "since_stop_ms": since }));
+            let sp = speeches.entry(item_id.clone()).or_default();
+            // Live mode: this item is the oldest phrase we closed.
+            if let Some(at) = clock.commits.pop_front() {
+                sp.stopped_at = Some(at);
+                sp.started_at = clock.starts.pop_front().or(sp.started_at);
+            }
+            timing("committed", json!({ "id": item_id, "since_stop_ms": sp.since_stop_ms() }));
         }
         "conversation.item.input_audio_transcription.delta" => {
             let sp = speeches.entry(item_id.clone()).or_default();
+            if sp.started_at.is_none() {
+                // Live mode: text of the phrase that is open now (deltas come before its `committed`).
+                sp.started_at = clock.starts.front().copied();
+            }
             if !std::mem::replace(&mut sp.got_text, true) {
-                timing("first_delta", json!({ "id": item_id, "since_stop_ms": sp.since_stop_ms() }));
+                timing("first_delta", json!({ "id": item_id, "since_stop_ms": sp.since_stop_ms(), "since_start_ms": sp.since_start_ms() }));
             }
             let delta = v["delta"].as_str().unwrap_or_default().to_string();
             shared.update(|s| {
@@ -392,7 +485,7 @@ fn handle(text: &str, shared: &Shared, ev_tx: &UnboundedSender<Ev>, speaker: Spe
             let full = v["transcript"].as_str().unwrap_or_default().trim().to_string();
             let sp = speeches.remove(&item_id).unwrap_or_default();
             let stt = SttTiming {
-                speech_secs: sp.started_ms.zip(sp.stopped_ms).map(|(a, b)| b.saturating_sub(a) as f64 / 1000.0),
+                speech_secs: sp.speech_secs(),
                 stt_secs: sp.stopped_at.map(|t| t.elapsed().as_secs_f64()),
             };
             timing(
@@ -512,6 +605,10 @@ mod tests {
             silence_ms: 500,
             mic_silence_ms: 900,
             prompt: String::new(),
+            // Off here: the tests below talk to a server that sends the old events.
+            live_model: String::new(),
+            max_phrase_secs: 12.0,
+            max_phrase_hard_secs: 20.0,
         }
     }
 
@@ -593,18 +690,7 @@ mod tests {
         let shared = Shared::new(None);
         let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
         let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
-        let cfg = Transcribe {
-            api_key: String::new(),
-            api_key_env: String::new(),
-            model: "m".into(),
-            language: "es".into(),
-            silence_threshold: 300.0,
-            mic_silence_threshold: 500.0,
-            capture_mic: true,
-            silence_ms: 500,
-            mic_silence_ms: 900,
-            prompt: String::new(),
-        };
+        let cfg = test_cfg();
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let (seen2, shared2) = (seen.clone(), shared.clone());
@@ -647,5 +733,208 @@ mod tests {
         drop(audio_tx);
         poll.abort();
         task.abort();
+    }
+    fn live_cfg() -> Transcribe {
+        Transcribe { live_model: "live-m".into(), ..test_cfg() }
+    }
+
+    #[test]
+    fn live_model_has_no_server_pause_detection_and_only_serves_the_other_person() {
+        let cfg = live_cfg();
+        let input = |sp| session_update(&cfg, sp)["session"]["audio"]["input"].clone();
+        let them = input(Speaker::Them);
+        assert_eq!(them["transcription"]["model"], json!("live-m"));
+        assert!(them["turn_detection"].is_null(), "the app commits the phrases itself");
+        // The microphone keeps the old model and the server's pause detection.
+        let me = input(Speaker::Me);
+        assert_eq!(me["transcription"]["model"], json!("m"));
+        assert_eq!(me["turn_detection"]["type"], json!("server_vad"));
+        // Language and prompt are sent for the live model too.
+        assert_eq!(them["transcription"]["language"], json!("es"));
+        // Without a live model nothing changes for the other person.
+        let old = session_update(&test_cfg(), Speaker::Them)["session"]["audio"]["input"].clone();
+        assert_eq!((old["transcription"]["model"].clone(), old["turn_detection"]["type"].clone()), (json!("m"), json!("server_vad")));
+    }
+
+    /// Server for one live connection: a delta right after the first audio, and the final text once the client commits.
+    async fn live_server(seen: UnboundedSender<Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            let mut sent_delta = false;
+            while let Some(Ok(m)) = ws.next().await {
+                // The client pings right away: only text frames matter here.
+                let Message::Text(t) = m else { continue };
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let ty = v["type"].as_str().unwrap_or_default().to_string();
+                let _ = seen.send(v);
+                if ty == "input_audio_buffer.append" && !sent_delta {
+                    sent_delta = true;
+                    let delta = json!({ "type": "conversation.item.input_audio_transcription.delta", "item_id": "a", "delta": "Hola" });
+                    ws.send(Message::Text(delta.to_string())).await.unwrap();
+                }
+                if ty == "input_audio_buffer.commit" {
+                    let committed = json!({ "type": "input_audio_buffer.committed", "item_id": "a" });
+                    let done = json!({ "type": "conversation.item.input_audio_transcription.completed", "item_id": "a", "transcript": "Hola mundo" });
+                    ws.send(Message::Text(committed.to_string())).await.unwrap();
+                    ws.send(Message::Text(done.to_string())).await.unwrap();
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn live_phrase_grows_while_spoken_and_is_committed_by_the_app_after_a_pause() {
+        let (seen_tx, mut seen) = unbounded_channel::<Value>();
+        let url = live_server(seen_tx).await;
+        let shared = Shared::new(None);
+        audio::threshold_set(&shared.read(|s| s.meters[Speaker::Them.idx()].threshold.clone()), 300.0);
+        let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+        let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
+        let task = tokio::spawn({
+            let shared = shared.clone();
+            async move { run_with_reconnect(&live_cfg(), &url, "k", audio_rx, shared, ev_tx, Speaker::Them).await }
+        });
+        // Two loud 100 ms frames, then nothing at all (as after the silence gate's hangover).
+        let loud: Vec<u8> = (0..2400).flat_map(|_| 2000i16.to_le_bytes()).collect();
+        audio_tx.send(loud.clone()).unwrap();
+        audio_tx.send(loud).unwrap();
+
+        // While the phrase is still open the text is already on screen, as a partial.
+        let mut partial = false;
+        for _ in 0..100 {
+            partial = shared.read(|s| s.segments.iter().any(|x| x.es == "Hola" && x.partial));
+            if partial {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(partial, "the delta must show before the phrase is closed");
+
+        let mut notes: Vec<(&str, Value)> = Vec::new();
+        let completed = loop {
+            match timeout(Duration::from_secs(5), ev_rx.recv()).await.expect("no commit after the pause").expect("channel closed") {
+                Ev::Completed { id, stt } => break (id, stt),
+                Ev::Note { kind, fields, .. } => notes.push((kind, fields)),
+                _ => {}
+            }
+        };
+        assert_eq!(completed.0, "them:a");
+        let stt = completed.1.expect("timing");
+        // The phrase lasted ~0.5 s of silence after the second frame; the final text came right after the commit.
+        assert!(stt.speech_secs.is_some_and(|s| (0.4..2.0).contains(&s)), "{stt:?}");
+        assert!(stt.stt_secs.is_some_and(|s| s < 1.0), "{stt:?}");
+        assert_eq!(shared.read(|s| s.segments.iter().map(|x| (x.es.clone(), x.partial)).collect::<Vec<_>>()), [("Hola mundo".to_string(), false)]);
+
+        let kinds: Vec<&str> = notes.iter().map(|n| n.0).collect();
+        let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap_or_else(|| panic!("no {k} in {kinds:?}"));
+        assert!(pos("speech_started") < pos("speech_stopped"), "{kinds:?}");
+        assert_eq!(notes[pos("speech_stopped")].1["reason"], json!("pause"));
+        assert!(notes[pos("first_delta")].1["since_start_ms"].is_u64(), "{:?}", notes[pos("first_delta")]);
+
+        // What the server saw: no pause detection in the session, one commit, after the audio.
+        let mut types = Vec::new();
+        let mut first = None;
+        while let Ok(v) = seen.try_recv() {
+            first.get_or_insert_with(|| v.clone());
+            types.push(v["type"].as_str().unwrap_or_default().to_string());
+        }
+        let first = first.unwrap();
+        assert_eq!(first["type"], json!("session.update"));
+        assert!(first["session"]["audio"]["input"]["turn_detection"].is_null());
+        assert_eq!(types.iter().filter(|t| *t == "input_audio_buffer.commit").count(), 1, "{types:?}");
+        assert_eq!(types.iter().position(|t| t == "input_audio_buffer.commit"), Some(types.len() - 1), "{types:?}");
+        task.abort();
+    }
+
+    #[test]
+    fn live_timing_comes_from_the_apps_own_clock() {
+        let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
+        let shared = Shared::new(None);
+        let mut speeches = HashMap::new();
+        let now = Instant::now();
+        let mut clock = LiveClock::default();
+        clock.starts.push_back(now - Duration::from_millis(3000));
+        clock.commits.push_back(now - Duration::from_millis(500));
+        let mut feed = |v: Value| handle(&v.to_string(), &shared, &ev_tx, Speaker::Them, &mut speeches, &mut clock).unwrap();
+        feed(json!({ "type": "conversation.item.input_audio_transcription.delta", "item_id": "a", "delta": "Hola" }));
+        feed(json!({ "type": "input_audio_buffer.committed", "item_id": "a" }));
+        feed(json!({ "type": "conversation.item.input_audio_transcription.completed", "item_id": "a", "transcript": "Hola" }));
+        let (mut first_delta, mut stt) = (None, None);
+        while let Ok(ev) = ev_rx.try_recv() {
+            match ev {
+                Ev::Note { kind: "first_delta", fields, .. } => first_delta = Some(fields),
+                Ev::Completed { stt: Some(t), .. } => stt = Some(t),
+                _ => {}
+            }
+        }
+        let ms = first_delta.expect("first_delta")["since_start_ms"].as_u64().expect("since_start_ms");
+        assert!((3000..3500).contains(&ms), "{ms}");
+        let stt = stt.expect("timing");
+        // Speech: from the start to the commit (2.5 s); the text came 0.5 s after the commit.
+        assert!(stt.speech_secs.is_some_and(|s| (s - 2.5).abs() < 0.05), "{stt:?}");
+        assert!(stt.stt_secs.is_some_and(|s| (0.5..1.0).contains(&s)), "{stt:?}");
+        assert!(clock.starts.is_empty() && clock.commits.is_empty());
+    }
+    /// Real OpenAI with the live model; costs money (a 52 s recording is about $0.015). Run by hand:
+    /// `cargo test live_api -- --ignored --nocapture` (key from ~/assistant/config.toml; `LIVE_WAV` picks the recording,
+    /// a 24 kHz 16-bit mono wav). Feeds the recording through `run_with_reconnect` at real speed.
+    #[tokio::test]
+    #[ignore]
+    async fn live_api_smoke_with_a_recorded_monologue() {
+        let wav = std::env::var("LIVE_WAV").unwrap_or_else(|_| "issues/02/experiments/audio/exp2_52s_0858-0950.wav".into());
+        let bytes = std::fs::read(&wav).unwrap_or_else(|e| panic!("{wav}: {e}"));
+        let data = bytes.windows(4).position(|w| w == b"data").expect("data chunk") + 8;
+        let pcm = bytes[data..].to_vec();
+        let home = std::env::var("HOME").unwrap();
+        let cfg = crate::config::Config::load(&format!("{home}/assistant/config.toml")).unwrap();
+        let mut tcfg = Transcribe { live_model: "gpt-live-transcribe".into(), ..cfg.transcribe.clone() };
+        tcfg.prompt = stt_prompt(&tcfg.language, Some("inteligencia-artificial"), "");
+        let key = tcfg.key().unwrap();
+
+        let shared = Shared::new(None);
+        audio::threshold_set(&shared.read(|s| s.meters[Speaker::Them.idx()].threshold.clone()), tcfg.silence_threshold);
+        let (audio_tx, audio_rx) = unbounded_channel::<Vec<u8>>();
+        let (ev_tx, mut ev_rx) = unbounded_channel::<Ev>();
+        let task = tokio::spawn({
+            let shared = shared.clone();
+            async move { run_with_reconnect(&tcfg, REALTIME_URL, &key, audio_rx, shared, ev_tx, Speaker::Them).await }
+        });
+        let feeder = tokio::spawn(async move {
+            sleep(Duration::from_secs(2)).await; // let the connection come up
+            let mut tick = interval(Duration::from_millis(100));
+            for c in pcm.chunks(4800) {
+                tick.tick().await;
+                audio_tx.send(c.to_vec()).unwrap();
+            }
+            sleep(Duration::from_secs(1)).await;
+            drop(audio_tx);
+        });
+
+        let (mut phrases, mut first_ms, mut last_event) = (Vec::new(), Vec::new(), Instant::now());
+        // Inside a long phrase nothing is reported until it is closed (up to 20 s): wait for the end of the audio first.
+        while !(feeder.is_finished() && last_event.elapsed() > Duration::from_secs(6)) {
+            let Ok(Some(ev)) = timeout(Duration::from_secs(1), ev_rx.recv()).await else { continue };
+            last_event = Instant::now();
+            match ev {
+                Ev::Note { kind: "first_delta", fields, .. } => first_ms.push(fields["since_start_ms"].as_u64()),
+                Ev::Note { kind: "speech_stopped", fields, .. } => println!("closed: {} after {} ms", fields["reason"], fields["speech_ms"]),
+                Ev::Completed { id, stt } => {
+                    let text = shared.read(|s| s.segments.iter().find(|x| x.item_id == id).map(|x| x.es.clone())).unwrap_or_default();
+                    println!("phrase {id}: speech {:?} s, stt {:?} s: {text}", stt.as_ref().and_then(|t| t.speech_secs), stt.as_ref().and_then(|t| t.stt_secs));
+                    phrases.push((stt.and_then(|t| t.speech_secs).unwrap_or(0.0), text));
+                }
+                _ => {}
+            }
+        }
+        task.abort();
+        println!("first words after (ms from the start of each phrase): {first_ms:?}");
+        assert!(shared.read(|s| s.conn_error.is_none()), "{:?}", shared.read(|s| s.conn_error.clone()));
+        assert!(phrases.len() >= 3, "a 52 s monologue must be cut into several phrases: {phrases:?}");
+        assert!(phrases.iter().all(|(secs, text)| *secs <= 21.0 && !text.trim().is_empty()), "{phrases:?}");
+        assert!(first_ms.first().copied().flatten().is_some_and(|ms| ms < 4000), "{first_ms:?}");
     }
 }

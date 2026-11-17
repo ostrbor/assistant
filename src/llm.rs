@@ -418,7 +418,7 @@ mod tests {
         done.tokens = Some((7, 3));
         done.end(Outcome::Won);
         drop(done);
-        let s = meter.summary("t", [0.0, 0.0]);
+        let s = meter.summary(["t"; 2], [0.0, 0.0]);
         let by = |m: &str| s.lines.iter().find(|l| l.model == m).unwrap().clone();
         assert!(by("m1").estimated && by("m1").input == 100 && by("m1").output == 10);
         assert!(by("m0").estimated);

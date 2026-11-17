@@ -90,13 +90,15 @@ pub struct Price {
     pub per_minute: f64,
 }
 
-/// Prices checked on 2026-11-14: OpenAI's pricing page for transcription, and the per-provider
+/// Prices checked on 2026-11-14 (`gpt-live-transcribe`: 2026-11-17): OpenAI's pricing page for transcription, and the per-provider
 /// prices that `https://router.huggingface.co/v1/models` lists for the HF router (which passes
 /// provider rates through without markup). Providers change them: override in
 /// `[prices."<model>"]` of config.toml when they differ.
 const DEFAULT_PRICES: &[(&str, Price)] = &[
     ("gpt-4o-transcribe", Price { input: 2.5, output: 10.0, per_minute: 0.006 }),
     ("gpt-4o-mini-transcribe", Price { input: 1.25, output: 5.0, per_minute: 0.003 }),
+    // Live transcription is billed per minute of audio only.
+    ("gpt-live-transcribe", Price { input: 0.0, output: 0.0, per_minute: 0.017 }),
     ("openai/gpt-oss-20b:groq", Price { input: 0.10, output: 0.50, per_minute: 0.0 }),
     ("Qwen/Qwen3-235B-A22B-Instruct-2507:parasail", Price { input: 0.14, output: 0.80, per_minute: 0.0 }),
     ("openai/gpt-oss-120b:groq", Price { input: 0.15, output: 0.75, per_minute: 0.0 }),
@@ -216,14 +218,15 @@ impl UsageMeter {
     }
 
     /// Condenses the session. `audio_sent` is the seconds of audio sent to the transcriber for
-    /// [speakers, microphone]; it stands in for token counts when OpenAI reported none.
-    pub fn summary(&self, transcribe_model: &str, audio_sent: [f64; 2]) -> Summary {
+    /// [speakers, microphone], `transcribe_models` the model each of them used; the audio time
+    /// stands in for token counts when OpenAI reported neither tokens nor seconds.
+    pub fn summary(&self, transcribe_models: [&str; 2], audio_sent: [f64; 2]) -> Summary {
         let g = self.inner.lock().unwrap();
         let mut rows: Vec<(Call, bool)> = g.calls.iter().map(|(_, c)| (c.clone(), false)).collect();
         for (i, purpose) in [Purpose::TranscribeThem, Purpose::TranscribeMe].into_iter().enumerate() {
-            let reported = g.calls.iter().any(|(_, c)| c.purpose == purpose && (c.input_tokens > 0 || c.output_tokens > 0));
+            let reported = g.calls.iter().any(|(_, c)| c.purpose == purpose && (c.input_tokens > 0 || c.output_tokens > 0 || c.audio_secs > 0.0));
             if audio_sent[i] > 0.0 && !reported {
-                let call = Call { purpose, model: transcribe_model.into(), input_tokens: 0, output_tokens: 0, audio_secs: audio_sent[i], duration: Duration::ZERO, outcome: Outcome::Won, estimated: true };
+                let call = Call { purpose, model: transcribe_models[i].into(), input_tokens: 0, output_tokens: 0, audio_secs: audio_sent[i], duration: Duration::ZERO, outcome: Outcome::Won, estimated: true };
                 rows.push((call, true));
             }
         }
@@ -249,11 +252,11 @@ impl UsageMeter {
             l.estimated |= c.estimated;
             l.cost = l.cost.zip(self.prices.cost(c)).map(|(a, b)| a + b);
         }
-        let sent_total: f64 = audio_sent.iter().sum();
         let mut lines: Vec<Line> = lines.into_values().collect();
         for l in lines.iter_mut().filter(|l| l.what == "transcribe") {
-            // The connection works for as long as audio is flowing.
-            l.audio_secs = l.audio_secs.max(sent_total);
+            // The connection works for as long as audio is flowing: the audio sent to this model.
+            let sent: f64 = (0..2).filter(|&i| transcribe_models[i] == l.model).map(|i| audio_sent[i]).sum();
+            l.audio_secs = l.audio_secs.max(sent);
             l.busy = Duration::from_secs_f64(l.audio_secs);
         }
         Summary {
@@ -367,7 +370,7 @@ mod tests {
         m.record(call(Purpose::Hint, "openai/gpt-oss-120b:groq", 1_000_000, 500_000, Outcome::Won));
         m.record(call(Purpose::Hint, "openai/gpt-oss-120b:groq", 1_000_000, 0, Outcome::Lost));
         m.record(call(Purpose::Translate, "unknown-model", 10, 10, Outcome::Won));
-        let s = m.summary("gpt-4o-transcribe", [0.0, 0.0]);
+        let s = m.summary(["gpt-4o-transcribe"; 2], [0.0, 0.0]);
         let hint = s.lines.iter().find(|l| l.what == "hint").unwrap();
         assert_eq!((hint.requests, hint.input), (2, 2_000_000));
         // 2M in * 0.15 + 0.5M out * 0.75
@@ -386,13 +389,41 @@ mod tests {
     fn transcription_falls_back_to_audio_minutes() {
         let m = UsageMeter::new(Prices::new(&HashMap::new()));
         m.begin(None);
-        let s = m.summary("gpt-4o-transcribe", [600.0, 0.0]);
+        let s = m.summary(["gpt-4o-transcribe"; 2], [600.0, 0.0]);
         let l = &s.lines[0];
         assert!(l.estimated && (l.cost.unwrap() - 0.06).abs() < 1e-9, "{l:?}");
         // With reported tokens the audio time is not billed twice.
         m.record(call(Purpose::TranscribeThem, "gpt-4o-transcribe", 1_000_000, 0, Outcome::Won));
-        let s = m.summary("gpt-4o-transcribe", [600.0, 0.0]);
+        let s = m.summary(["gpt-4o-transcribe"; 2], [600.0, 0.0]);
         assert!((s.total - 2.5).abs() < 1e-9 && !s.estimated);
+    }
+
+    #[test]
+    fn live_model_is_priced_per_minute_and_seconds_are_not_billed_twice() {
+        let m = UsageMeter::new(Prices::new(&HashMap::new()));
+        m.begin(None);
+        let models = ["gpt-live-transcribe", "gpt-4o-transcribe"];
+        // Nothing reported: the audio sent stands in (10 min * $0.017).
+        let s = m.summary(models, [600.0, 0.0]);
+        assert!(s.estimated && (s.total - 0.17).abs() < 1e-9, "{s:?}");
+        // The server reports seconds per phrase: those are real, and the sent audio is not added on top.
+        for secs in [250.0, 350.0] {
+            m.record(Call { audio_secs: secs, ..call(Purpose::TranscribeThem, "gpt-live-transcribe", 0, 0, Outcome::Won) });
+        }
+        let s = m.summary(models, [600.0, 0.0]);
+        assert!(!s.estimated && (s.total - 0.17).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn each_transcription_model_gets_the_audio_of_its_own_speaker() {
+        let m = UsageMeter::new(Prices::new(&HashMap::new()));
+        m.begin(None);
+        // Speakers on the live model for 10 min, the microphone on the other one for 5 min.
+        let s = m.summary(["gpt-live-transcribe", "gpt-4o-transcribe"], [600.0, 300.0]);
+        let secs = |model: &str| s.lines.iter().find(|l| l.model == model).unwrap().audio_secs;
+        assert_eq!((secs("gpt-live-transcribe"), secs("gpt-4o-transcribe")), (600.0, 300.0));
+        // 0.17 for the live one + 5 min * $0.006 for the other.
+        assert!((s.total - (0.17 + 0.03)).abs() < 1e-9, "{s:?}");
     }
 
     #[test]

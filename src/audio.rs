@@ -300,7 +300,7 @@ impl SilenceGate {
 }
 
 /// Root-mean-square level of little-endian i16 samples.
-fn rms(frame: &[u8]) -> f64 {
+pub fn rms(frame: &[u8]) -> f64 {
     let (samples, _) = frame.as_chunks::<2>();
     if samples.is_empty() {
         return 0.0;

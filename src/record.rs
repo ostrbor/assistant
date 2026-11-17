@@ -273,7 +273,7 @@ mod tests {
         let log = SessionLog::create(&d, &cfg, None).unwrap();
         let meter = crate::usage::UsageMeter::new(crate::usage::Prices::new(&cfg.prices));
         meter.begin(Some(log.dir()));
-        let summary = meter.summary(&cfg.transcribe.model, [60.0, 0.0]);
+        let summary = meter.summary([cfg.transcribe.model.as_str(); 2], [60.0, 0.0]);
         log.cost(&summary);
         let cost = std::fs::read_to_string(log.dir().join("cost.txt")).unwrap();
         assert!(cost.starts_with("Session cost") && cost.contains("gpt-4o-transcribe"), "{cost}");

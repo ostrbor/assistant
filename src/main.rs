@@ -6,6 +6,7 @@ mod hint;
 mod interview;
 mod llm;
 mod logfile;
+mod phrase;
 mod realtime;
 mod record;
 mod search;

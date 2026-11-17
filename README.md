@@ -45,7 +45,7 @@ On the first start the app creates `~/assistant/` with a default `config.toml` a
 
 **Timings and service events.** `session.log` starts with the wall-clock start time; every line carries the offset from it. Utterances show how long the speech was and how long it took to become text (`(speech 2.8 s, stt +0.6 s)`), translations show their delay (`RU (+0.9 s)`), hints show the model that won, the document search time, the time to the first token and the total. Service events are logged too: `CONN THEM: connection lost … (attempt 1, retry in 1 s)`, `reconnected after 1.4 s offline`, server errors, `AUDIO …` device losses.
 
-For comparing recordings, `events.jsonl` in the same folder has one JSON object per event with `t` (seconds from the session start) and `ev`. Stages: `speech_started` / `speech_stopped` / `committed` / `first_delta` / `stt_completed` (`stt_ms` = end of speech → final text), `translate` (`ms`), `hint_start` / `hint_search` / `hint_model` (one per model in the race: `first_token_ms`, `total_ms`, `outcome`) / `hint_done` / `hint_shown`, and `conn_up` / `conn_lost` / `conn_reconnected` / `server_error` / `audio_lost` / `audio_recovered`. Median speech-to-text delay over several sessions:
+For comparing recordings, `events.jsonl` in the same folder has one JSON object per event with `t` (seconds from the session start) and `ev`. Stages: `speech_started` / `speech_stopped` / `committed` / `first_delta` / `stt_completed` (`stt_ms` = end of speech → final text), `translate` (`ms`), `hint_start` / `hint_search` / `hint_model` (one per model in the race: `first_token_ms`, `total_ms`, `outcome`) / `hint_done` / `hint_shown`, and `conn_up` / `conn_lost` / `conn_reconnected` / `server_error` / `audio_lost` / `audio_recovered`. With the live model the app itself reports `speech_started` / `speech_stopped` (`live: true`, `reason`: `pause`, `long` or `hard`, `speech_ms`), and `first_delta` carries `since_start_ms` (start of the phrase → first word on screen). Median speech-to-text delay over several sessions:
 
 ```
 cat sessions/*/events.jsonl | jq -s '[.[] | select(.ev=="stt_completed" and .stt_ms) | .stt_ms] | sort | .[length/2|floor]'
@@ -129,8 +129,10 @@ Everything is in `config.toml`:
 | `hint_auto` | `true` (default) keeps the hint up to date by itself: after every phrase of the other person the model keeps, refines or replaces it; `false` means only the *Hint* button. |
 | `[transcribe] api_key` | OpenAI API key. If empty, the variable named in `api_key_env` is used. |
 | `[llm] api_key` | Key of the LLM endpoint (Hugging Face token by default). If empty, the variable named in `api_key_env` is used. |
-| `[transcribe] model, language` | Realtime transcription model and the spoken language. |
-| `[transcribe] silence_ms, mic_silence_ms` | Quiet time in ms after which a phrase counts as finished: for the other person (default 500) and for your microphone (default 900, longer so that an answer with pauses stays in one piece). |
+| `[transcribe] model, language` | Realtime transcription model (your microphone, and the other person when `live_model` is empty) and the spoken language. |
+| `[transcribe] live_model` | Model for the other person that streams text while they speak (default `gpt-live-transcribe`, about $1 per hour of their speech). Their words show up about 2 s after the sound instead of after the phrase ends; a long monologue no longer stays blank. Empty: use `model` and the server's pause detection, as before. |
+| `[transcribe] max_phrase_secs, max_phrase_hard_secs` | Live mode only: a phrase longer than 12 s is closed at the first real dip (200 ms) in the sound, so translation and hints do not wait for the end of a monologue; one that never dips is cut at 20 s. |
+| `[transcribe] silence_ms, mic_silence_ms` | Quiet time in ms after which a phrase counts as finished: for the other person (default 500; with `live_model` the app measures it itself against the silence threshold) and for your microphone (default 900, longer so that an answer with pauses stays in one piece). |
 | `[transcribe] prompt` | Extra words for the recognizer (names, terms). The language and the chosen document folder are sent along by themselves. |
 | `[transcribe] silence_threshold, mic_silence_threshold` | RMS level (16-bit samples, default 300 and 500) below which audio from the speakers / the microphone counts as silence and is not sent. Raise it if background noise keeps the stream open, lower it if quiet speech is cut off. |
 | `[transcribe] capture_mic` | `true` (default) also transcribes your own voice, so hints know what you already said. |
@@ -146,7 +148,7 @@ PDF text extraction loses math symbols that a PDF draws as graphics (∧ ∨ ∪
 
 ## Cost
 
-Rough figures; check current pricing. Transcription is the main cost, on the order of a few tenths of a dollar per hour of audio sent while *Listen* is on. Silence is not sent, and the microphone is a second stream (only your own speech counts), so the total depends on how much is actually said. Translation and hints send only a few thousand tokens per request, which amounts to cents per call.
+Rough figures; check current pricing. Transcription is the main cost: the other person on the live model (`gpt-live-transcribe`, $0.017 per minute) is about $1 per hour of audio sent while *Listen* is on, your microphone on `gpt-4o-transcribe` a few tenths of a dollar. Silence is not sent, and the microphone is a second stream (only your own speech counts), so the total depends on how much is actually said. Translation and hints send only a few thousand tokens per request, which amounts to cents per call.
 
 ## Checking your setup
 

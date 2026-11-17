@@ -77,6 +77,17 @@ pub struct Transcribe {
     /// Extra words for the recognizer (names, terms). The language and the chosen folder are added by themselves.
     #[serde(default)]
     pub prompt: String,
+    /// Model for the other person that streams text while they speak (no server-side pause
+    /// detection: the app decides itself where a phrase ends). Empty: use `model` for both sides.
+    #[serde(default = "default_live_model")]
+    pub live_model: String,
+    /// A live phrase that goes on longer than this is closed at the next short dip in the sound,
+    /// so that translation and hints do not wait for the end of a long monologue.
+    #[serde(default = "default_max_phrase_secs")]
+    pub max_phrase_secs: f64,
+    /// ... and one that never dips is cut at this length anyway.
+    #[serde(default = "default_max_phrase_hard_secs")]
+    pub max_phrase_hard_secs: f64,
 }
 
 fn default_silence_threshold() -> f64 {
@@ -93,6 +104,18 @@ fn default_silence_ms() -> u64 {
 
 fn default_mic_silence_ms() -> u64 {
     900
+}
+
+fn default_live_model() -> String {
+    "gpt-live-transcribe".into()
+}
+
+fn default_max_phrase_secs() -> f64 {
+    12.0
+}
+
+fn default_max_phrase_hard_secs() -> f64 {
+    20.0
 }
 
 fn default_hint_chunks() -> usize {
@@ -131,6 +154,16 @@ pub fn resolve_key(api_key: &str, env: &str) -> Option<String> {
 }
 
 impl Transcribe {
+    /// The other person is transcribed live (text while they speak, phrases cut by the app).
+    pub fn live(&self) -> bool {
+        !self.live_model.trim().is_empty()
+    }
+
+    /// Model for the other person (`them`) or for the microphone.
+    pub fn model_for(&self, them: bool) -> &str {
+        if them && self.live() { self.live_model.trim() } else { &self.model }
+    }
+
     pub fn key(&self) -> Result<String> {
         resolve_key(&self.api_key, &self.api_key_env)
             .context("OpenAI API key is not set (set [transcribe] api_key in config.toml)")

@@ -143,7 +143,7 @@ pub async fn run(core: Arc<Core>, mut cmd_rx: UnboundedReceiver<Cmd>) {
                     if session.is_some() {
                         core.usage.record(Call {
                             purpose: if speaker == Speaker::Me { Purpose::TranscribeMe } else { Purpose::TranscribeThem },
-                            model: core.cfg.transcribe.model.clone(),
+                            model: core.cfg.transcribe.model_for(speaker == Speaker::Them).to_string(),
                             input_tokens,
                             output_tokens,
                             audio_secs: seconds,
@@ -368,7 +368,7 @@ fn stop(session: &mut Option<Session>, core: &Arc<Core>) {
     // Audio actually sent per source, read before the meters are touched again.
     let audio_sent = core.shared.read(|s| [Speaker::Them, Speaker::Me].map(|k| s.meters[k.idx()].bytes_sent as f64 / BYTES_PER_SEC));
     // Only a session that was really running has a cost to report.
-    let cost = running.is_some().then(|| core.usage.summary(&core.cfg.transcribe.model, audio_sent));
+    let cost = running.is_some().then(|| core.usage.summary([core.cfg.transcribe.model_for(true), core.cfg.transcribe.model_for(false)], audio_sent));
     if let Some(r) = core.rec.lock().unwrap().take() {
         r.stopped();
         if let Some(c) = &cost {
